@@ -35,7 +35,7 @@ use tantivy::Directory;
 use time::OffsetDateTime;
 use tracing::{info, info_span, instrument, Instrument};
 
-use super::LocalSplitStore;
+use super::IndexingSplitCache;
 use crate::get_tantivy_directory_from_split_bundle;
 
 /// IndexingSplitStore is a wrapper around a regular `Storage` to upload and
@@ -52,11 +52,11 @@ use crate::get_tantivy_directory_from_split_bundle;
 /// In order to alleviate the disk IO as well as the network bandwidth,
 /// we save new splits into a split store.
 ///
-/// The role of the `IndexingSplitStore` is to act as a cache to avoid
-/// unnecessary download of fresh splits. Its behavior are however very different
+/// The role of the `IndexingSplitStore` is to combine a cache and a storage
+/// to avoid unnecessary download of fresh splits. Its behavior are however very different
 /// from a usual cache as we have a strong knowledge of the split lifecycle.
 ///
-/// The splits are stored on the local filesystem in `LocalSplitStore`.
+/// The splits are stored on the local filesystem in the `IndexingSplitCache`.
 #[derive(Clone)]
 pub struct IndexingSplitStore {
     inner: Arc<InnerIndexingSplitStore>,
@@ -65,7 +65,7 @@ pub struct IndexingSplitStore {
 struct InnerIndexingSplitStore {
     /// The remote storage.
     remote_storage: Arc<dyn Storage>,
-    local_split_store: Arc<LocalSplitStore>,
+    split_cache: Arc<IndexingSplitCache>,
 }
 
 pub struct WeakIndexingSplitStore {
@@ -84,10 +84,10 @@ impl IndexingSplitStore {
     /// Creates an instance of [`IndexingSplitStore`]
     ///
     /// It needs the remote storage to work with.
-    pub fn new(remote_storage: Arc<dyn Storage>, local_split_store: Arc<LocalSplitStore>) -> Self {
+    pub fn new(remote_storage: Arc<dyn Storage>, split_cache: Arc<IndexingSplitCache>) -> Self {
         let inner = InnerIndexingSplitStore {
             remote_storage,
-            local_split_store,
+            split_cache,
         };
         Self {
             inner: Arc::new(inner),
@@ -99,7 +99,7 @@ impl IndexingSplitStore {
     pub fn create_without_local_store_for_test(remote_storage: Arc<dyn Storage>) -> Self {
         let inner = InnerIndexingSplitStore {
             remote_storage,
-            local_split_store: Arc::new(LocalSplitStore::no_caching()),
+            split_cache: Arc::new(IndexingSplitCache::no_caching()),
         };
         IndexingSplitStore {
             inner: Arc::new(inner),
@@ -165,7 +165,7 @@ impl IndexingSplitStore {
             info!("store-in-cache");
             if self
                 .inner
-                .local_split_store
+                .split_cache
                 .move_into_cache(split.split_id(), split_folder_path)
                 .await?
             {
@@ -202,7 +202,7 @@ impl IndexingSplitStore {
         let path = PathBuf::from(quickwit_common::split_file(split_id));
         if let Some(split_path) = self
             .inner
-            .local_split_store
+            .split_cache
             .get_cached_split(split_id, output_dir_path)
             .await?
         {
@@ -234,8 +234,8 @@ impl IndexingSplitStore {
 
     /// Takes a snapshot of the cache view (only used for testing).
     #[cfg(any(test, feature = "testsuite"))]
-    pub async fn inspect_local_store(&self) -> HashMap<String, ByteSize> {
-        self.inner.local_split_store.inspect().await
+    pub async fn inspect_split_cache(&self) -> HashMap<String, ByteSize> {
+        self.inner.split_cache.inspect().await
     }
 }
 
@@ -254,7 +254,7 @@ mod tests {
     use ulid::Ulid;
 
     use super::IndexingSplitStore;
-    use crate::split_store::{LocalSplitStore, SplitStoreQuota};
+    use crate::split_store::{IndexingSplitCache, SplitStoreQuota};
 
     fn create_test_split_metadata(split_id: &str) -> SplitMetadata {
         SplitMetadata {
@@ -272,13 +272,13 @@ mod tests {
         let temp_dir = tempfile::tempdir()?;
         let split_cache_dir = tempdir()?;
 
-        let local_split_store = LocalSplitStore::open(
+        let split_cache = IndexingSplitCache::open(
             split_cache_dir.path().to_path_buf(),
             SplitStoreQuota::default(),
         )
         .await?;
         let remote_storage = Arc::new(RamStorage::default());
-        let split_store = IndexingSplitStore::new(remote_storage, Arc::new(local_split_store));
+        let split_store = IndexingSplitStore::new(remote_storage, Arc::new(split_cache));
 
         let split_id1 = Ulid::new().to_string();
         let split_id2 = Ulid::new().to_string();
@@ -296,7 +296,7 @@ mod tests {
                 .path()
                 .join(format!("{split_id1}.split"))
                 .try_exists()?);
-            let local_store_stats = split_store.inspect_local_store().await;
+            let local_store_stats = split_store.inspect_split_cache().await;
             assert_eq!(local_store_stats.len(), 1);
             assert_eq!(
                 local_store_stats.get(&split_id1).cloned(),
@@ -318,7 +318,7 @@ mod tests {
                 .try_exists()?);
         }
 
-        let local_store_stats = split_store.inspect_local_store().await;
+        let local_store_stats = split_store.inspect_split_cache().await;
         assert_eq!(local_store_stats.len(), 2);
         assert_eq!(
             local_store_stats.get(&split_id1).cloned(),
@@ -337,14 +337,14 @@ mod tests {
         let temp_dir = tempfile::tempdir()?;
 
         let split_cache_dir = tempdir()?;
-        let local_split_store = LocalSplitStore::open(
+        let split_cache = IndexingSplitCache::open(
             split_cache_dir.path().to_path_buf(),
             SplitStoreQuota::new(1, ByteSize::mb(1)),
         )
         .await?;
 
         let remote_storage = Arc::new(RamStorage::default());
-        let split_store = IndexingSplitStore::new(remote_storage, Arc::new(local_split_store));
+        let split_store = IndexingSplitStore::new(remote_storage, Arc::new(split_cache));
 
         let split_id1 = Ulid::new().to_string();
         let split_id2 = Ulid::new().to_string();
@@ -370,10 +370,10 @@ mod tests {
                 .path()
                 .join(format!("{split_id1}.split"))
                 .try_exists()?);
-            let local_store_stats = split_store.inspect_local_store().await;
-            assert_eq!(local_store_stats.len(), 1);
+            let split_cache_stats = split_store.inspect_split_cache().await;
+            assert_eq!(split_cache_stats.len(), 1);
             assert_eq!(
-                local_store_stats.get(&split_id1).cloned(),
+                split_cache_stats.get(&split_id1).cloned(),
                 Some(ByteSize(11))
             );
         }
@@ -399,10 +399,10 @@ mod tests {
                 .path()
                 .join(format!("{split_id2}.split"))
                 .try_exists()?);
-            let local_store_stats = split_store.inspect_local_store().await;
-            assert_eq!(local_store_stats.len(), 1);
+            let split_cache_stats = split_store.inspect_split_cache().await;
+            assert_eq!(split_cache_stats.len(), 1);
             assert_eq!(
-                local_store_stats.get(&split_id2).cloned(),
+                split_cache_stats.get(&split_id2).cloned(),
                 Some(ByteSize(12))
             );
         }
