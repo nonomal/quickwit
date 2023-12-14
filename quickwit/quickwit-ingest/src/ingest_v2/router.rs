@@ -68,7 +68,7 @@ pub struct IngestRouter {
     ingester_pool: IngesterPool,
     state: Arc<RwLock<RouterState>>,
     replication_factor: usize,
-    write_semaphore: SemaphoreWithMaxWaiters,
+    ingest_permits: Arc<SemaphoreWithMaxWaiters>,
 }
 
 struct RouterState {
@@ -103,7 +103,7 @@ impl IngestRouter {
             ingester_pool,
             state,
             replication_factor,
-            write_semaphore: SemaphoreWithMaxWaiters::new(1, 10),
+            ingest_permits: Arc::new(SemaphoreWithMaxWaiters::new(1, 10)),
         }
     }
 
@@ -422,11 +422,12 @@ impl IngestRouterService for IngestRouter {
         &mut self,
         ingest_request: IngestRequestV2,
     ) -> IngestV2Result<IngestResponseV2> {
-        let _permit = self
-            .write_semaphore
+        let ingest_permits = self.ingest_permits.clone();
+        let _ingest_permit = ingest_permits
             .acquire()
             .await
             .map_err(|()| IngestV2Error::TooManyRequests)?;
+
         with_request_metrics!(
             self.ingest_timeout(ingest_request, INGEST_REQUEST_TIMEOUT)
                 .await,

@@ -17,75 +17,70 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 
-/// `SemaphoreWithLimitedWaiters` is an extension of semaphore
+/// [`SemaphoreWithMaxWaiters`] is an extension of semaphore
 /// that limits the number of waiters.
 ///
 /// If more than n-waiters then acquire returns an error.
-#[derive(Clone)]
 pub struct SemaphoreWithMaxWaiters {
-    permits: Arc<Semaphore>,
-    // Implementation detail:
-    // We do not use the async semaphore mechanics.
-    // The waiter count could have implemented using a simple atomic counter.
-    // We use a semaphore to avoid the need to reimplement the looping compare-and-swap dance.
-    waiter_count: Arc<Semaphore>,
+    permits: Semaphore,
+    num_waiters: AtomicUsize,
+    max_num_waiters: usize,
 }
 
 impl SemaphoreWithMaxWaiters {
-    /// Creates a new `SemaphoreWithLimitedWaiters`.
+    /// Creates a new [`SemaphoreWithMaxWaiters`].
     pub fn new(num_permits: usize, max_num_waiters: usize) -> Self {
         Self {
-            permits: Arc::new(Semaphore::new(num_permits)),
-            waiter_count: Arc::new(Semaphore::new(max_num_waiters)),
+            permits: Semaphore::new(num_permits),
+            num_waiters: AtomicUsize::new(0),
+            max_num_waiters,
         }
     }
 
     /// Acquires a permit.
-    pub async fn acquire(&self) -> Result<OwnedSemaphorePermit, ()> {
-        match Semaphore::try_acquire_owned(self.permits.clone()) {
+    pub async fn acquire(&self) -> Result<SemaphorePermit<'_>, ()> {
+        match self.permits.try_acquire() {
             Ok(permit) => {
                 return Ok(permit);
             }
             Err(TryAcquireError::NoPermits) => {}
             Err(TryAcquireError::Closed) => {
-                panic!("semaphore closed (this should never happen)");
-            }
-        };
-        // We bind wait_permit to a variable to extend its lifetime,
-        // (so we keep holding the associated permit).
-        let _wait_permit = match Semaphore::try_acquire_owned(self.waiter_count.clone()) {
-            Ok(wait_permit) => wait_permit,
-            Err(TryAcquireError::NoPermits) => {
-                return Err(());
-            }
-            Err(TryAcquireError::Closed) => {
                 // The `permits` semaphore should never be closed because we don't expose the
-                // `close` API and never call `close` internally.
-                panic!("semaphore closed");
+                // `Semaphore::close` API and never call it internally.
+                panic!("semaphore should not be closed");
             }
         };
-        let permit = Semaphore::acquire_owned(self.permits.clone())
+        if self.num_waiters.load(Ordering::Acquire) >= self.max_num_waiters {
+            return Err(());
+        }
+        self.num_waiters.fetch_add(1, Ordering::Release);
+        let permit = self
+            .permits
+            .acquire()
             .await
-            .expect("semaphore closed "); // (See justification above)
+            .expect("semaphore should not be closed"); // (See justification above)
+        self.num_waiters.fetch_sub(1, Ordering::Release);
         Ok(permit)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[tokio::test]
-    async fn test_semaphore_with_waiters() {
-        let semaphore_with_waiters = super::SemaphoreWithMaxWaiters::new(1, 1);
+    async fn test_semaphore_max_waiters() {
+        let semaphore_with_waiters = Arc::new(super::SemaphoreWithMaxWaiters::new(1, 1));
         let permit = semaphore_with_waiters.acquire().await.unwrap();
         let semaphore_with_waiters_clone = semaphore_with_waiters.clone();
-        let join_handle =
-            tokio::task::spawn(async move { semaphore_with_waiters_clone.acquire().await });
+        let join_handle = tokio::task::spawn(async move {
+            let _ = semaphore_with_waiters_clone.acquire().await;
+        });
         assert!(!join_handle.is_finished());
         tokio::time::sleep(Duration::from_millis(500)).await;
         for _ in 0..10 {
