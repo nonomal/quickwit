@@ -53,7 +53,7 @@ use tantivy::tokenizer::TokenizerManager;
 use tantivy::{DateTime, IndexBuilder, IndexSettings};
 use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tracing::{info, info_span, warn, Span};
+use tracing::{info, info_span, warn, Span, debug_span};
 use ulid::Ulid;
 
 use crate::actors::IndexSerializer;
@@ -183,13 +183,13 @@ impl IndexerState {
         ctx: &ActorContext<Indexer>,
     ) -> anyhow::Result<IndexingWorkbench> {
         let workbench_id = Ulid::new();
-        let batch_parent_span = info_span!(target: "quickwit-indexing", "index-doc-batches",
+        let batch_parent_span = debug_span!(target: "quickwit-indexing", "index-doc-batches",
             index_id=%self.pipeline_id.index_uid.index_id(),
             source_id=%self.pipeline_id.source_id,
             pipeline_uid=%self.pipeline_id.pipeline_uid,
             workbench_id=%workbench_id,
         );
-        let indexing_span = info_span!(parent: batch_parent_span.id(), "indexer");
+        let indexing_span = debug_span!(parent: batch_parent_span.id(), "indexer");
         let indexing_permit =
             if let Some(cooperative_indexing_permits) = &self.cooperative_indexing_permits {
                 let indexing_permit: OwnedSemaphorePermit = ctx
