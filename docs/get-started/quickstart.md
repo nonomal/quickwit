@@ -62,6 +62,8 @@ docker run --rm -v $(pwd)/qwdata:/quickwit/qwdata -p 127.0.0.1:7280:7280 quickwi
 
 </Tabs>
 
+Tips: you can use the environment variable `RUST_LOG` to control quickwit verbosity.
+
 Check it's working by browsing the [UI at http://localhost:7280](http://localhost:7280) or do a simple GET with cURL:
 
 ```bash
@@ -115,7 +117,7 @@ search_settings:
   default_search_fields: [title, body]
 
 indexing_settings:
-  commit_timeout_secs: 10
+  commit_timeout_secs: 30
 ```
 
 Now we can create the index with the command:

@@ -18,7 +18,9 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use once_cell::sync::Lazy;
-use quickwit_common::metrics::{new_counter_vec, new_histogram_vec, HistogramVec, IntCounterVec};
+use quickwit_common::metrics::{
+    exponential_buckets, new_counter_vec, new_histogram_vec, HistogramVec, IntCounterVec,
+};
 
 pub struct OtlpServiceMetrics {
     pub requests_total: IntCounterVec<4>,
@@ -35,37 +37,44 @@ impl Default for OtlpServiceMetrics {
             requests_total: new_counter_vec(
                 "requests_total",
                 "Number of requests",
-                "quickwit_otlp",
+                "otlp",
+                &[],
                 ["service", "index", "transport", "format"],
             ),
             request_errors_total: new_counter_vec(
                 "request_errors_total",
                 "Number of failed requests",
-                "quickwit_otlp",
+                "otlp",
+                &[],
                 ["service", "index", "transport", "format"],
             ),
             request_duration_seconds: new_histogram_vec(
                 "request_duration_seconds",
                 "Duration of requests",
-                "quickwit_otlp",
+                "otlp",
+                &[],
                 ["service", "index", "transport", "format", "error"],
+                exponential_buckets(0.02, 2.0, 8).unwrap(),
             ),
             ingested_log_records_total: new_counter_vec(
                 "ingested_log_records_total",
                 "Number of log records ingested",
-                "quickwit_otlp",
+                "otlp",
+                &[],
                 ["service", "index", "transport", "format"],
             ),
             ingested_spans_total: new_counter_vec(
                 "ingested_spans_total",
                 "Number of spans ingested",
-                "quickwit_otlp",
+                "otlp",
+                &[],
                 ["service", "index", "transport", "format"],
             ),
             ingested_bytes_total: new_counter_vec(
                 "ingested_bytes_total",
                 "Number of bytes ingested",
-                "quickwit_otlp",
+                "otlp",
+                &[],
                 ["service", "index", "transport", "format"],
             ),
         }

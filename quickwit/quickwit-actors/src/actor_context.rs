@@ -191,15 +191,7 @@ impl<A: Actor> ActorContext<A> {
         self.actor_state.get_state()
     }
 
-    pub(crate) fn process(&self) {
-        self.actor_state.process();
-    }
-
-    pub(crate) fn idle(&self) {
-        self.actor_state.idle();
-    }
-
-    pub(crate) fn pause(&self) {
+    pub fn pause(&self) {
         self.actor_state.pause();
     }
 
@@ -249,7 +241,7 @@ impl<A: Actor> ActorContext<A> {
     /// This method hides logic to prevent an actor from being identified
     /// as frozen if the destination actor channel is saturated, and we
     /// are simply experiencing back pressure.
-    pub async fn send_message<DestActor: Actor, M>(
+    pub async fn send_message<DestActor, M>(
         &self,
         mailbox: &Mailbox<DestActor>,
         msg: M,
@@ -268,7 +260,7 @@ impl<A: Actor> ActorContext<A> {
             .await
     }
 
-    pub async fn ask<DestActor: Actor, M, T>(
+    pub async fn ask<DestActor, M, T>(
         &self,
         mailbox: &Mailbox<DestActor>,
         msg: M,
@@ -286,7 +278,7 @@ impl<A: Actor> ActorContext<A> {
 
     /// Similar to `send_message`, except this method
     /// waits asynchronously for the actor reply.
-    pub async fn ask_for_res<DestActor: Actor, M, T, E>(
+    pub async fn ask_for_res<DestActor, M, T, E>(
         &self,
         mailbox: &Mailbox<DestActor>,
         msg: M,
@@ -347,21 +339,21 @@ impl<A: Actor> ActorContext<A> {
         self.self_mailbox.try_send_message(msg)
     }
 
-    /// Schedules a message that will be sent to the high-priority
-    /// queue of the actor Mailbox once `after_duration` has elapsed.
-    pub async fn schedule_self_msg<M>(&self, after_duration: Duration, message: M)
+    /// Schedules a message that will be sent to the high-priority queue of the
+    /// actor Mailbox once `after_duration` has elapsed.
+    ///
+    /// Note that this holds a reference to the actor mailbox until the message
+    /// is actually sent.
+    pub fn schedule_self_msg<M>(&self, after_duration: Duration, message: M)
     where
         A: DeferableReplyHandler<M>,
         M: Sync + Send + std::fmt::Debug + 'static,
     {
-        let self_mailbox = self.inner.self_mailbox.clone();
+        let self_mailbox = self.mailbox().clone();
         let callback = move || {
             let _ = self_mailbox.send_message_with_high_priority(message);
         };
-        self.inner
-            .spawn_ctx
-            .scheduler_client
-            .schedule_event(callback, after_duration);
+        self.spawn_ctx().schedule_event(callback, after_duration);
     }
 }
 

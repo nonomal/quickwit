@@ -23,7 +23,8 @@ use quickwit_cluster::{Cluster, ClusterSnapshot, NodeIdSchema};
 use warp::{Filter, Rejection};
 
 use crate::format::extract_format_from_qs;
-use crate::json_api_response::make_json_api_response;
+use crate::rest::recover_fn;
+use crate::rest_api_response::into_rest_api_response;
 
 #[derive(utoipa::OpenApi)]
 #[openapi(
@@ -42,7 +43,9 @@ pub fn cluster_handler(
         .and(warp::path::end().map(move || cluster.clone()))
         .then(get_cluster)
         .and(extract_format_from_qs())
-        .map(make_json_api_response)
+        .map(into_rest_api_response)
+        .recover(recover_fn)
+        .boxed()
 }
 
 #[utoipa::path(

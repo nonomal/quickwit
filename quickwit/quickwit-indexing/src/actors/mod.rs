@@ -17,6 +17,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+mod cooperative_indexing;
 mod doc_processor;
 mod index_serializer;
 mod indexer;
@@ -25,6 +26,7 @@ mod indexing_service;
 mod merge_executor;
 mod merge_pipeline;
 mod merge_planner;
+mod merge_scheduler_service;
 mod merge_split_downloader;
 mod packager;
 mod publisher;
@@ -37,12 +39,11 @@ pub use doc_processor::{DocProcessor, DocProcessorCounters};
 pub use index_serializer::IndexSerializer;
 pub use indexer::{Indexer, IndexerCounters};
 pub use indexing_pipeline::{IndexingPipeline, IndexingPipelineParams};
-pub use indexing_service::{
-    IndexingService, IndexingServiceCounters, MergePipelineId, INDEXING_DIR_NAME,
-};
+pub use indexing_service::{IndexingService, IndexingServiceCounters, INDEXING_DIR_NAME};
 pub use merge_executor::{combine_partition_ids, merge_split_attrs, MergeExecutor};
-pub use merge_pipeline::MergePipeline;
-pub use merge_planner::MergePlanner;
+pub use merge_pipeline::{FinishPendingMergesAndShutdownPipeline, MergePipeline};
+pub(crate) use merge_planner::{MergePlanner, RunFinalizeMergePolicyAndQuit};
+pub use merge_scheduler_service::{schedule_merge, MergePermit, MergeSchedulerService};
 pub use merge_split_downloader::MergeSplitDownloader;
 pub use packager::Packager;
 pub use publisher::{Publisher, PublisherCounters, PublisherType};

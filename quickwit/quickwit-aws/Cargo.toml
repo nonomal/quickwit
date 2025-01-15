@@ -1,33 +1,32 @@
 [package]
 name = "quickwit-aws"
-version = "0.7.0"
-authors = ["Quickwit, Inc. <hello@quickwit.io>"]
-edition = "2021"
-license = "AGPL-3.0-or-later"                           # For a commercial, license, contact hello@quickwit.io
-description = "Utilities for working with AWS."
-repository = "https://github.com/quickwit-oss/quickwit"
-homepage = "https://quickwit.io/"
-documentation = "https://quickwit.io/docs/"
+description = "Set up AWS config and clients"
+
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
 
 [dependencies]
 aws-config = { workspace = true }
+aws-runtime = { workspace = true }
 aws-sdk-kinesis = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true }
+aws-sdk-sqs = { workspace = true, optional = true }
 aws-smithy-async = { workspace = true }
-aws-smithy-client = { workspace = true }
+aws-smithy-runtime = { workspace = true }
 aws-types = { workspace = true }
 
-async-trait = { workspace = true }
 futures = { workspace = true }
 hyper = { workspace = true }
 hyper-rustls = { workspace = true }
-once_cell = { workspace = true }
-rand = { workspace = true }
 tokio = { workspace = true }
-tower = { workspace = true }
-tracing = { workspace = true }
 
 quickwit-common = { workspace = true }
 
 [features]
 kinesis = ["aws-sdk-kinesis"]
+sqs = ["aws-sdk-sqs"]

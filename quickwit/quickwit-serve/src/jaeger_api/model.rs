@@ -33,7 +33,7 @@ pub(super) const DEFAULT_NUMBER_OF_TRACES: i32 = 20;
 pub(super) fn build_jaeger_traces(spans: Vec<JaegerSpan>) -> anyhow::Result<Vec<JaegerTrace>> {
     let jaeger_traces: Vec<JaegerTrace> = spans
         .into_iter()
-        .group_by(|span| span.trace_id.clone())
+        .chunk_by(|span| span.trace_id.clone())
         .into_iter()
         .map(|(span_id, group)| JaegerTrace::new(span_id, group.collect()))
         .collect();
@@ -55,9 +55,11 @@ pub struct TracesSearchQueryParams {
     pub service: Option<String>,
     #[serde(default)]
     pub operation: Option<String>,
+    // these are microsecond precision
     pub start: Option<i64>,
     pub end: Option<i64>,
     pub tags: Option<String>,
+    // these are unit-suffixed numbers. in practice we only support precision up to the ms
     pub min_duration: Option<String>,
     pub max_duration: Option<String>,
     pub lookback: Option<String>,
@@ -93,7 +95,7 @@ impl JaegerTrace {
     /// `service_name` values. The function uses an accumulator (`acc`) to keep track of
     /// processed `JaegerProcess` objects and assigns a new key to each unique `service_name` value.
     /// The logic has been replicated from
-    /// https://github.com/jaegertracing/jaeger/blob/995231c42cadd70bce2bbbf02579e33f6e6329c8/model/converter/json/process_hashtable.go#L37
+    /// <https://github.com/jaegertracing/jaeger/blob/995231c42cadd70bce2bbbf02579e33f6e6329c8/model/converter/json/process_hashtable.go#L37>
     /// TODO: use also tags to identify processes.
     fn build_process_map(spans: &mut [JaegerSpan]) -> HashMap<String, JaegerProcess> {
         let mut service_name_to_process_id: HashMap<String, String> = HashMap::new();
@@ -296,7 +298,7 @@ impl Default for JaegerProcess {
         Self {
             service_name: "none".to_string(),
             key: "".to_string(),
-            tags: vec![],
+            tags: Vec::new(),
         }
     }
 }
@@ -382,7 +384,7 @@ mod tests {
             }),
             process: Some(quickwit_proto::jaeger::api_v2::Process {
                 service_name: "service-x".to_string(),
-                tags: vec![],
+                tags: Vec::new(),
             }),
             logs: vec![
                 Log {
@@ -426,7 +428,7 @@ mod tests {
             }),
             process: Some(quickwit_proto::jaeger::api_v2::Process {
                 service_name: "service-x".to_string(),
-                tags: vec![],
+                tags: Vec::new(),
             }),
             process_id: "".to_string(),
             tags: vec![
@@ -488,7 +490,7 @@ mod tests {
             }),
             process: Some(quickwit_proto::jaeger::api_v2::Process {
                 service_name: "service-y".to_string(),
-                tags: vec![],
+                tags: Vec::new(),
             }),
             process_id: "".to_string(),
             ..Default::default()
@@ -524,7 +526,7 @@ mod tests {
             }),
             process: Some(quickwit_proto::jaeger::api_v2::Process {
                 service_name: "service-y".to_string(),
-                tags: vec![],
+                tags: Vec::new(),
             }),
             process_id: "".to_string(),
             warnings: vec!["some span warning".to_string()],
@@ -549,7 +551,7 @@ mod tests {
             }),
             process: Some(quickwit_proto::jaeger::api_v2::Process {
                 service_name: "service-y".to_string(),
-                tags: vec![],
+                tags: Vec::new(),
             }),
             process_id: "".to_string(),
             warnings: vec!["some span warning".to_string()],

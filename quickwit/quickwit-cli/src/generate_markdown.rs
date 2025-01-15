@@ -24,11 +24,7 @@ use toml::Value;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let build_info = BuildInfo::get();
-    let version_text = format!(
-        "{} ({} {})",
-        build_info.cargo_pkg_version, build_info.cargo_pkg_version, build_info.commit_date,
-    );
+    let version_text = BuildInfo::get_version_text();
     let app = build_cli()
         .version(version_text)
         .disable_help_subcommand(true);
@@ -47,11 +43,13 @@ fn markdown_for_subcommand(
     subcommand: &Command,
     command_group: Vec<String>,
     doc_extensions: &toml::Value,
+    level: usize,
 ) {
     let subcommand_name = subcommand.get_name();
 
     let command_name = format!("{} {}", command_group.join(" "), subcommand_name);
-    println!("### {command_name}\n");
+    let header_level = "#".repeat(level);
+    println!("{header_level} {command_name}\n");
 
     let subcommand_ext: Option<&Value> = {
         let mut val_opt: Option<&Value> = doc_extensions.get(command_group[0].to_string());
@@ -143,7 +141,7 @@ fn markdown_for_command_helper(
             println!("| Option | Description | Default |");
             println!("|-----------------|-------------|--------:|");
             for arg in arguments {
-                let default = if let Some(val) = arg.get_default_values().get(0) {
+                let default = if let Some(val) = arg.get_default_values().first() {
                     format!("`{}`", val.to_str().unwrap())
                 } else {
                     "".to_string()
@@ -199,20 +197,20 @@ fn generate_markdown_from_clap(command: &Command) {
             continue;
         }
 
-        let excluded_doc_commands = ["merge"];
+        let excluded_doc_commands = ["merge", "local-search"];
         for subcommand in command
             .get_subcommands()
             .filter(|subcommand| !excluded_doc_commands.contains(&subcommand.get_name()))
         {
             let commands = vec![command.get_name().to_string()];
-            markdown_for_subcommand(subcommand, commands, &doc_extensions);
+            markdown_for_subcommand(subcommand, commands, &doc_extensions, 3);
 
             for subsubcommand in subcommand.get_subcommands() {
                 let commands = vec![
                     command.get_name().to_string(),
                     subcommand.get_name().to_string(),
                 ];
-                markdown_for_subcommand(subsubcommand, commands, &doc_extensions);
+                markdown_for_subcommand(subsubcommand, commands, &doc_extensions, 4);
             }
         }
     }

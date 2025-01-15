@@ -16,7 +16,7 @@ There are two categories: [Metrics](#metric-aggregations) and [Buckets](#bucket-
 #### Prerequisite
 
 To be able to use aggregations on a field, the field needs to have a fast field index created. A fast field index is a columnar storage,
-where documents values are extracted and stored to.
+where documents values are extracted and stored.
 
 Example to create a fast field on text for term aggregations.
 ```yaml
@@ -28,6 +28,12 @@ fast: true
 ```
 
 See the [index configuration](../configuration/index-config.md) page for more details and examples.
+
+#### API Endpoint
+
+The endpoints for aggregations are the search endpoints:
+- Quickwit API: `api/v1/<index id>/search`
+- Elasticsearch API: `api/v1/_elastic/<index_id>/_search`.
 
 #### Format
 
@@ -102,6 +108,7 @@ Response
     - [Stats](#stats)
     - [Sum](#sum)
     - [Percentiles](#percentiles)
+    - [Cardinality](#cardinality)
 
 
 ## Bucket Aggregations
@@ -114,9 +121,14 @@ These sub-aggregations will be aggregated for the buckets created by their “pa
 There are different bucket aggregators, each with a different “bucketing” strategy.
 Some define a single bucket, some define a fixed number of multiple buckets, and others dynamically create the buckets during the aggregation process.
 
-Example request, histogram with stats in each bucket:
 
-#### Aggregating on datetime fields
+### Histogram
+
+A histogram is a type of bucket aggregation where documents are grouped into buckets based on a fixed interval. Each document's value is "rounded down" to the nearest bucket boundary.
+
+E.g. if we have a price 18 and an interval of 5, the document will fall into the bucket with the key 15. The formula used for this is: `((val - offset) / interval).floor() * interval + offset`.
+
+#### Histogram on datetime fields
 
 See [`DateHistogram`](#date-histogram) for more convenient API for `datetime` fields.
 
@@ -124,7 +136,7 @@ Fields of type `datetime` are handled the same way as any numeric field. However
 
 Histogram with one bucket per day on a `datetime` field. `interval` needs to be provided in milliseconds.
 In the following example, we grouped documents per day (`1 day = 86400000 milliseconds`).
-The returned format is currently fixed at `Rfc3339`.
+The returned format is currently fixed at `RFC3339`.
 
 ##### Request
 ```json skip
@@ -132,7 +144,7 @@ The returned format is currently fixed at `Rfc3339`.
   "query": "*",
   "max_hits": 0,
   "aggs": {
-    "datetime_histogram":{
+    "count_per_day":{
       "histogram":{
         "field": "datetime",
         "interval": 86400000
@@ -147,7 +159,7 @@ The returned format is currently fixed at `Rfc3339`.
 {
   ...
   "aggregations": {
-    "datetime_histogram": {
+    "count_per_day": {
       "buckets": [
         {
           "doc_count": 1,
@@ -165,17 +177,12 @@ The returned format is currently fixed at `Rfc3339`.
 }
 ```
 
-### Histogram
-
-Histogram is a bucket aggregation, where buckets are created dynamically for the given interval. Each document value is rounded down to its bucket.
-
-E.g. if we have a price 18 and an interval of 5, the document will fall into the bucket with the key 15. The formula used for this is: ((val - offset) / interval).floor() * interval + offset.
 
 #### Returned Buckets
 
-By default buckets are returned between the min and max value of the documents, including empty buckets. Setting min_doc_count to != 0 will filter empty buckets.
+By default buckets are returned between the min and max value of the documents, including empty buckets. Setting `min_doc_count > 0` will filter empty buckets.
 
-The value range of the buckets can bet extended via extended_bounds or limit the range via hard_bounds.
+The value range of the buckets can bet extended via [`extended_bounds`](#extended_bounds) or limit the range via [`hard_bounds`](#hard_bounds).
 
 #### Example
 
@@ -291,7 +298,7 @@ Cannot be set in conjunction with `min_doc_count` > 0, since the empty buckets f
 
 `DateHistogram` is similar to `Histogram`, but it can only be used with [datetime type](../configuration/index-config#datetime-type) and provides a more convenient API to define intervals.
 
-Like the histogram, values are rounded down into the closest bucket.
+Like the histogram, values are rounded down to the closest bucket.
 
 The returned format is currently fixed at `Rfc3339`.
 
@@ -369,7 +376,7 @@ time unit (e.g., `1.5h` could instead be specified as `90m`).
 
 ###### **offset**
 
-Intervals implicitly defines an absolute grid of buckets `[interval * k, interval * (k + 1))`.
+Intervals implicitly define an absolute grid of buckets `[interval * k, interval * (k + 1))`.
 Offset makes it possible to shift this grid into `[offset + interval * k, offset + interval (k + 1))`. Offset has to be in the range [0, interval).
 
 This is especially useful when using `fixed_interval`, to shift the first bucket e.g. at the start of the year.
@@ -494,23 +501,23 @@ Response
 
 #### Document count error
 In Quickwit, we have one segment per split. Therefore the results returned from a split, is equivalent to results returned from a segment.
-To improve performance, results from one split are cut off at `split_size`.
+To improve performance, results from one split are cut off at `shard_size`.
 When combining results of multiple splits, terms that
 don't make it in the top n of a result from a split increase the theoretical upper bound error by lowest
 term-count.
 
-Even with a larger `split_size` value, doc_count values for a terms aggregation may be
+Even with a larger `shard_size` value, doc_count values for a terms aggregation may be
 approximate. As a result, any sub-aggregations on the terms aggregation may also be approximate.
 `sum_other_doc_count` is the number of documents that didn’t make it into the the top size
-terms. If this is greater than 0, you can be sure that the terms agg had to throw away some
+terms. If this is greater than 0, the terms agg had to throw away some
 buckets, either because they didn’t fit into `size` on the root node or they didn’t fit into
-`split_size` on the leaf node.
+`shard_size` on the leaf node.
 
 #### Per bucket document count error
 If you set the `show_term_doc_count_error` parameter to true, the terms aggregation will include
 doc_count_error_upper_bound, which is an upper bound to the error on the doc_count returned by
 each split. It’s the sum of the size of the largest bucket on each split that didn’t fit
-into `split_size`.
+into `shard_size`.
 
 #### Parameters
 
@@ -524,17 +531,28 @@ Currently term aggregation only works on fast fields of type `text`, `f64`, `i64
 
 By default, the top 10 terms with the most documents are returned. Larger values for size are more expensive.
 
-###### **split_size**
+###### **shard_size**
 
-The get more accurate results, we fetch more than size from each segment/split.
-Increasing this value is will increase the accuracy, but also the CPU/memory usage.
+To obtain more accurate results, we fetch more than the `size` from each segment/split.
 
-Defaults to size * 1.5 + 10.
+Increasing this value will enhance accuracy but will also increase CPU/memory usage. 
+Refer to the [`document count error`](#document-count-error) section for more information on how `shard_size` impacts accuracy.
+
+`shard_size` represents the number of terms that are returned from one split. 
+For example, if there are 100 splits and `shard_size` is set to 1000, the root node may receive up to 100_000 terms to merge. 
+Assuming an average cost of 50 bytes per term, this would require up to 5MB of memory. 
+The actual number of terms sent to the root depends on the number of splits handled by one node and how the intermediate results can be merged (e.g., the cardinality of the terms).
+
+Note on differences between Quickwit and Elasticsearch:
+* Unlike Elasticsearch, Quickwit does not use global ordinals, so serialized terms need to be sent to the root node.
+* The concept of shards in Elasticsearch differs from splits in Quickwit. In Elasticsearch, a shard contains up to 200M documents and is a collection of segments. In contrast, a Quickwit split comprises a single segment, typically with 5M documents. Therefore, `shard_size` in Elasticsearch applies to a group of segments, whereas in Quickwit, it applies to a single segment.
+
+Defaults to `size * 10`.
 
 ###### **show_term_doc_count_error**
 
 If you set the show_term_doc_count_error parameter to true, the terms aggregation will include doc_count_error_upper_bound, which is an upper bound to the error on the doc_count returned by each split.
-It’s the sum of the size of the largest bucket on each split that didn’t fit into split_size.
+It’s the sum of the size of the largest bucket on each split that didn’t fit into `shard_size`.
 
 Defaults to true when ordering by count desc.
 
@@ -545,12 +563,19 @@ Filter all terms that are lower than `min_doc_count`. Defaults to 1.
 
 _Expensive_ : When set to 0, this will return all terms in the field.
 
+###### **missing**
+
+The `missing` parameter defines how documents that are missing a value should be treated.
+By default they will be ignored but it is also possible to treat them as if they had a value.
+```json skip
+{ "field": "genre", "missing": "NO_DATA" }
+```
 
 ###### **order**
 
 Set the order. String is here a target, which is either “_count”, “_key”, or the name of a metric sub_aggregation.
 Single value metrics like average can be addressed by its name. Multi value metrics like stats are required to address their field by name e.g. “stats.avg”.
-
+_Limitation_ : Ordering is only supported by one property currently. Passing an array for `order` is _not_ supported `"order": [{ "average_price": "asc" }, { "_key": "asc" }]`.
 
 Order alphabetically
 ```json skip
@@ -634,6 +659,15 @@ Supported field types are `u64`, `f64`, `i64`, and `datetime`.
 }
 ```
 
+#### Parameters
+
+###### **missing**
+The `missing` parameter defines how documents that are missing a value should be treated.
+By default they will be ignored but it is also possible to treat them as if they had a value.
+```json skip
+{ "field": "price", "missing": "10.0" }
+```
+
 ### Count
 
 A single-value metric aggregation that counts the number of values that are extracted from the aggregated documents.
@@ -665,6 +699,14 @@ Supported field types are `u64`, `f64`, `i64`, and `datetime`.
         }
     }
 }
+```
+#### Parameters
+
+###### **missing**
+The `missing` parameter defines how documents that are missing a value should be treated.
+By default they will be ignored but it is also possible to treat them as if they had a value.
+```json skip
+{ "field": "price", "missing": "10.0" }
 ```
 
 ### Max
@@ -699,6 +741,14 @@ Supported field types are `u64`, `f64`, `i64`, and `datetime`.
     }
 }
 ```
+#### Parameters
+
+###### **missing**
+The `missing` parameter defines how documents that are missing a value should be treated.
+By default they will be ignored but it is also possible to treat them as if they had a value.
+```json skip
+{ "field": "price", "missing": "10.0" }
+```
 
 ### Min
 
@@ -731,6 +781,14 @@ Supported field types are `u64`, `f64`, `i64`, and `datetime`.
         }
     }
 }
+```
+#### Parameters
+
+###### **missing**
+The `missing` parameter defines how documents that are missing a value should be treated.
+By default they will be ignored but it is also possible to treat them as if they had a value.
+```json skip
+{ "field": "price", "missing": "10.0" }
 ```
 
 ### Stats
@@ -772,6 +830,80 @@ Supported field types are `u64`, `f64`, `i64`, and `datetime`.
     }
 }
 ```
+#### Parameters
+
+###### **missing**
+The `missing` parameter defines how documents that are missing a value should be treated.
+By default they will be ignored but it is also possible to treat them as if they had a value.
+```json skip
+{ "field": "price", "missing": "10.0" }
+```
+
+### Extended Stats
+
+Extended stats is the same as `stats`, but with following additional metrics: `sum_of_squares`, `variance`, `std_deviation`, and `std_deviation_bounds`.
+Supported field types are `u64`, `f64`, `i64`, and `datetime`.
+
+**Request**
+```json
+{
+    "query": "*",
+    "max_hits": 0,
+    "aggs": {
+        "response_extended_stats": {
+            "extended_stats": { "field": "response" }
+        }
+    }
+}
+```
+
+**Response**
+```json
+{
+    ..
+    "aggregations": {
+        "response_extended_stats": {
+            "avg": 65.55555555555556,
+            "count": 9,
+            "max": 130.0,
+            "min": 20.0,
+            "std_deviation": 42.97573245736381,
+            "std_deviation_bounds": {
+                "lower": -20.395909359172062,
+                "lower_population": -20.395909359172062,
+                "lower_sampling": -25.60973998562673,
+                "upper": 151.50702047028318,
+                "upper_population": 151.50702047028318,
+                "upper_sampling": 156.72085109673785
+            },
+            "std_deviation_population": 42.97573245736381,
+            "std_deviation_sampling": 45.582647770591144,
+            "sum": 590.0,
+            "sum_of_squares": 55300.0,
+            "variance": 1846.9135802469136,
+            "variance_population": 1846.9135802469136,
+            "variance_sampling": 2077.777777777778
+        }
+    }
+}
+```
+
+#### Parameters
+
+###### **missing**
+The `missing` parameter defines how documents that are missing a value should be treated.
+By default they will be ignored but it is also possible to treat them as if they had a value.
+```json skip
+{ "field": "price", "missing": "10.0" }
+```
+
+###### **sigma**
+
+The sigma parameter controls how many standard deviations +/- from the mean should be displayed.
+The default value is 2.
+```json skip
+{ "field": "price", "sigma": "3.0" }
+```
 
 ### Sum
 
@@ -805,6 +937,16 @@ Supported field types are `u64`, `f64`, `i64`, and `datetime`.
     }
 }
 ```
+
+#### Parameters
+
+###### **missing**
+The `missing` parameter defines how documents that are missing a value should be treated.
+By default they will be ignored but it is also possible to treat them as if they had a value.
+```json skip
+{ "field": "price", "missing": "10.0" }
+```
+
 
 
 ### Percentiles
@@ -861,6 +1003,76 @@ In the case of website load times, this would typically be a field containing th
 While percentiles provide valuable insights into the distribution of data, it's important to understand that they are often estimates.
 This is because calculating exact percentiles for large data sets can be computationally expensive and time-consuming.
 
+#### Parameters
 
+###### **missing**
+The `missing` parameter defines how documents that are missing a value should be treated.
+By default they will be ignored but it is also possible to treat them as if they had a value.
+```json skip
+{ "field": "price", "missing": "10.0" }
+```
+
+
+### Cardinality
+The cardinality aggregation is used to approximate the count of distinct values in a field. 
+Cardinality aggregations are essential when working with large datasets where computing the exact count of distinct values would be computationally expensive. 
+
+The cardinality aggregation can be useful to e.g. to count the number of unique users visiting a website or to determine the number of unique IP addresses that have logged into a server over a certain period.
+
+The algorithm behind the cardinality aggregation is based on HyperLogLog++, which provides an approximate count over the hashed values.
+
+To use the cardinality aggregation, you need to specify the field on which to perform the aggregation.
+
+**Request**
+```json
+{
+    "query": "*",
+    "max_hits": 0,
+    "aggs": {
+        "unique_users": {
+            "cardinality": {
+                "field": "user_id"
+            }
+        }
+    }
+}
+```
+
+**Response**
+```json
+{
+    "num_hits": 9582098,
+    "hits": [],
+    "elapsed_time_micros": 101142,
+    "errors": [],
+    "aggregations": {
+        "unique_users": {
+            "value": 345672
+        }
+    }
+}
+```
+
+
+#### Parameters
+
+###### **missing**
+The `missing` parameter defines how documents that are missing a value should be treated.
+By default they will be ignored but it is also possible to treat them as if they had a value.
+```json skip
+{ "field": "price", "missing": "10.0" }
+```
+
+#### Performance
+
+The cardinality aggregation on text fields is computationally expensive for datasets with a large amount of unique values. 
+This is because the aggregation computes the hash for each unique term in the field. 
+In order to do this, Quickwit will for each split first collect the term ids and then fetch the compressed terms for those term ids from the dictionary.
+Decompressing the terms is comparatively expensive and keeping the term ids increases the memory usage.
+
+For numeric fields, the cardinality aggregation is much more efficient as it directly computes the hash of the numeric values and adds them to HLL++.
+
+##### Limitations
+The parameter `precision_threshold` is ignored currently. Normally it allows to set the threshold until the aggregation is exact.
 
 

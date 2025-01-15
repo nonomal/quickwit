@@ -1,6 +1,10 @@
 help:
 	@grep '^[^\.#[:space:]].*:' Makefile
 
+doc:
+	@echo "Running cargo doc"
+	@RUSTDOCFLAGS='-Dwarnings -Arustdoc::private_intra_doc_links' cargo doc --all-features
+
 fmt:
 	@echo "Formatting Rust files"
 	@(rustup toolchain list | ( ! grep -q nightly && echo "Toolchain 'nightly' is not installed. Please install using 'rustup toolchain install nightly'.") ) || cargo +nightly fmt
@@ -9,9 +13,13 @@ fmt:
 	@echo "Checking log format"
 	@bash scripts/check_log_format.sh
 
+dependency-licenses.html: Cargo.lock scripts/about.hbs scripts/about.toml
+	@echo "Checking dependency licenses"
+	@cargo about generate -c scripts/about.toml scripts/about.hbs -o dependency-licenses.html --workspace
+
 fix:
 	@echo "Running cargo clippy --fix"
-	@cargo clippy --fix --all-features --allow-dirty --allow-staged
+	@cargo clippy --workspace --all-features --tests --fix --allow-dirty --allow-staged
 	@$(MAKE) fmt
 
 # Usage:
@@ -25,11 +33,20 @@ test-all:
 	QW_S3_ENDPOINT=http://localhost:4566 \
 	QW_S3_FORCE_PATH_STYLE_ACCESS=1 \
 	QW_TEST_DATABASE_URL=postgres://quickwit-dev:quickwit-dev@localhost:5432/quickwit-metastore-dev \
-	cargo test --all-features
-	cargo test --test failpoints --features fail/failpoints
+	RUST_MIN_STACK=67108864 \
+	cargo nextest run --all-features --retries 5
+	cargo nextest run --test failpoints --features fail/failpoints
 
 test-failpoints:
-	cargo test --test failpoints --features fail/failpoints
+	cargo nextest run --test failpoints --features fail/failpoints
+
+test-lambda:
+	AWS_ACCESS_KEY_ID=ignored \
+	AWS_SECRET_ACCESS_KEY=ignored \
+	AWS_REGION=us-east-1 \
+	QW_S3_ENDPOINT=http://localhost:4566 \
+	QW_S3_FORCE_PATH_STYLE_ACCESS=1 \
+	cargo nextest run --all-features -p quickwit-lambda --retries 1
 
 # TODO: to be replaced by https://github.com/quickwit-oss/quickwit/issues/237
 TARGET ?= x86_64-unknown-linux-gnu

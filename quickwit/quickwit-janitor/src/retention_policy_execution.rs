@@ -18,7 +18,7 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use quickwit_actors::ActorContext;
-use quickwit_common::PrettySample;
+use quickwit_common::pretty::PrettySample;
 use quickwit_config::RetentionPolicy;
 use quickwit_metastore::{
     ListSplitsQuery, ListSplitsRequestExt, MetastoreServiceStreamSplitsExt, SplitMetadata,
@@ -43,7 +43,7 @@ use crate::actors::RetentionPolicyExecutor;
 /// * `ctx_opt` - A context for reporting progress (only useful within quickwit actor).
 pub async fn run_execute_retention_policy(
     index_uid: IndexUid,
-    mut metastore: MetastoreServiceClient,
+    metastore: MetastoreServiceClient,
     retention_policy: &RetentionPolicy,
     ctx: &ActorContext<RetentionPolicyExecutor>,
 ) -> anyhow::Result<Vec<SplitMetadata>> {
@@ -55,7 +55,7 @@ pub async fn run_execute_retention_policy(
         .with_split_state(SplitState::Published)
         .with_time_range_end_lte(max_retention_timestamp);
 
-    let list_splits_request = ListSplitsRequest::try_from_list_splits_query(query)?;
+    let list_splits_request = ListSplitsRequest::try_from_list_splits_query(&query)?;
     let (expired_splits, ignored_splits): (Vec<SplitMetadata>, Vec<SplitMetadata>) = ctx
         .protect_future(metastore.list_splits(list_splits_request))
         .await?
@@ -70,7 +70,7 @@ pub async fn run_execute_retention_policy(
             .map(|split_metadata| split_metadata.split_id)
             .collect();
         warn!(
-            index_id=%index_uid.index_id(),
+            index_id=%index_uid.index_id,
             split_ids=?PrettySample::new(&ignored_split_ids, 5),
             "Retention policy could not be applied to {} splits because they lack a timestamp range.",
             ignored_split_ids.len()
@@ -85,7 +85,7 @@ pub async fn run_execute_retention_policy(
         .map(|split_metadata| split_metadata.split_id.to_string())
         .collect();
     info!(
-        index_id=%index_uid.index_id(),
+        index_id=%index_uid.index_id,
         split_ids=?PrettySample::new(&expired_split_ids, 5),
         "Marking {} splits for deletion based on retention policy.",
         expired_split_ids.len()

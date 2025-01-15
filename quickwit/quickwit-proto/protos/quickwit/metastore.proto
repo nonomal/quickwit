@@ -21,21 +21,27 @@ syntax = "proto3";
 
 package quickwit.metastore;
 
+import "quickwit/common.proto";
 import "quickwit/ingest.proto";
 
 enum SourceType {
   SOURCE_TYPE_UNSPECIFIED = 0;
   SOURCE_TYPE_CLI = 1;
   SOURCE_TYPE_FILE = 2;
-  SOURCE_TYPE_GCP_PUBSUB = 3;
   SOURCE_TYPE_INGEST_V1 = 4;
   SOURCE_TYPE_INGEST_V2 = 5;
+  // Apache Kafka
   SOURCE_TYPE_KAFKA = 6;
+  // Amazon Kinesis
   SOURCE_TYPE_KINESIS = 7;
   SOURCE_TYPE_NATS = 8;
+  // Google Cloud Pub/Sub
+  SOURCE_TYPE_PUB_SUB = 3;
+  // Apache Pulsar
   SOURCE_TYPE_PULSAR = 9;
   SOURCE_TYPE_VEC = 10;
   SOURCE_TYPE_VOID = 11;
+  SOURCE_TYPE_STDIN = 13;
 }
 
 // Metastore meant to manage Quickwit's indexes, their splits and delete tasks.
@@ -91,8 +97,14 @@ service MetastoreService {
   // An error will occur if an index that already exists in the storage is specified.
   rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);
 
+  // Update an index.
+  rpc UpdateIndex(UpdateIndexRequest) returns (IndexMetadataResponse);
+
   // Returns the `IndexMetadata` of an index identified by its IndexID or its IndexUID.
   rpc IndexMetadata(IndexMetadataRequest) returns (IndexMetadataResponse);
+
+  // Fetches the metadata of a list of indexes identified by their Index IDs or UIDs.
+  rpc IndexesMetadata(IndexesMetadataRequest) returns (IndexesMetadataResponse);
 
   // Gets an indexes metadatas.
   rpc ListIndexesMetadata(ListIndexesMetadataRequest) returns (ListIndexesMetadataResponse);
@@ -153,13 +165,41 @@ service MetastoreService {
   // Acquires a set of shards for indexing. This RPC locks the shards for publishing thanks to a publish token and only
   // the last indexer that has acquired the shards is allowed to publish. The response returns for each subrequest the
   // list of acquired shards along with the positions to index from.
+  //
+  // If a requested shard is missing, this method does not return an error. It should simply return the list of
+  // shards that were actually acquired.
+  //
+  // For this reason, AcquireShards.acquire_shards may return less subresponse than there was in the request.
+  // Also they may be returned in any order.
   rpc AcquireShards(AcquireShardsRequest) returns (AcquireShardsResponse);
 
-  // Deletes a set of shards. This RPC deletes the shards from the metastore and the storage.
+  // Deletes a set of shards. This RPC deletes the shards from the metastore.
   // If the shard did not exist to begin with, the operation is successful and does not return any error.
   rpc DeleteShards(DeleteShardsRequest) returns (DeleteShardsResponse);
 
+  // Deletes outdated shards. This RPC deletes the shards from the metastore.
+  rpc PruneShards(PruneShardsRequest) returns (EmptyResponse);
+
   rpc ListShards(ListShardsRequest) returns (ListShardsResponse);
+
+  // Index Template API
+  //
+  // Index templates are used to create indexes with a predefined configuration.
+
+  // Creates an index template.
+  rpc CreateIndexTemplate(CreateIndexTemplateRequest) returns (EmptyResponse);
+
+  // Fetches an index template.
+  rpc GetIndexTemplate(GetIndexTemplateRequest) returns (GetIndexTemplateResponse);
+
+  // Finds matching index templates.
+  rpc FindIndexTemplateMatches(FindIndexTemplateMatchesRequest) returns (FindIndexTemplateMatchesResponse);
+
+  // Returns all the index templates.
+  rpc ListIndexTemplates(ListIndexTemplatesRequest) returns (ListIndexTemplatesResponse);
+
+  // Deletes index templates.
+  rpc DeleteIndexTemplates(DeleteIndexTemplatesRequest) returns (EmptyResponse);
 }
 
 message EmptyResponse {
@@ -167,23 +207,40 @@ message EmptyResponse {
 
 message CreateIndexRequest {
   string index_config_json = 2;
+  repeated string source_configs_json = 3;
 }
 
 message CreateIndexResponse {
-  string index_uid = 1;
+  quickwit.common.IndexUid index_uid = 1;
+  string index_metadata_json = 2;
+}
+
+message UpdateIndexRequest {
+  quickwit.common.IndexUid index_uid = 1;
+  string search_settings_json = 2;
+  optional string retention_policy_json = 3;
+  string indexing_settings_json = 4;
+  string doc_mapping_json = 5;
 }
 
 message ListIndexesMetadataRequest {
   reserved  1;
+  // List of patterns an index should match or not match to get considered
+  // An index must match at least one positive pattern (a pattern not starting
+  // with a '-'), and no negative pattern (a pattern starting with a '-').
   repeated string index_id_patterns = 2;
 }
 
 message ListIndexesMetadataResponse {
-  string indexes_metadata_serialized_json = 1;
+  // Deprecated (v0.9.0), use `indexes_metadata_json_zstd` instead.
+  optional string indexes_metadata_json_opt = 1;
+  // A JSON serialized then ZSTD compressed list of `IndexMetadata`: `Vec<IndexMetadata> | JSON | ZSTD`.
+  // We don't use `repeated` here to increase the compression rate and ratio.
+  bytes indexes_metadata_json_zstd = 2;
 }
 
 message DeleteIndexRequest {
-  string index_uid = 1;
+  quickwit.common.IndexUid index_uid = 1;
 }
 
 // Request the metadata of an index.
@@ -192,11 +249,39 @@ message DeleteIndexRequest {
 // If both are supplied, `index_uid` is used.
 message IndexMetadataRequest {
   optional string index_id = 1;
-  optional string index_uid = 2;
+  optional quickwit.common.IndexUid index_uid = 2;
 }
 
 message IndexMetadataResponse {
   string index_metadata_serialized_json = 1;
+}
+
+message IndexesMetadataRequest {
+  repeated IndexMetadataSubrequest subrequests = 1;
+}
+
+message IndexMetadataSubrequest {
+  optional string index_id = 1;
+  optional quickwit.common.IndexUid index_uid = 2;
+}
+
+message IndexesMetadataResponse {
+  // A JSON serialized then ZSTD compressed list of `IndexMetadata`: `Vec<IndexMetadata> | JSON | ZSTD`.
+  // We don't use `repeated` here to increase the compression rate and ratio.
+  bytes indexes_metadata_json_zstd = 1;
+  repeated IndexMetadataFailure failures = 2;
+}
+
+message IndexMetadataFailure {
+  optional string index_id = 1;
+  optional quickwit.common.IndexUid index_uid = 2;
+  IndexMetadataFailureReason reason = 3;
+}
+
+enum IndexMetadataFailureReason {
+  INDEX_METADATA_FAILURE_REASON_UNSPECIFIED = 0;
+  INDEX_METADATA_FAILURE_REASON_NOT_FOUND = 1;
+  INDEX_METADATA_FAILURE_REASON_INTERNAL = 2;
 }
 
 message ListSplitsRequest {
@@ -212,12 +297,12 @@ message ListSplitsResponse {
 }
 
 message StageSplitsRequest {
-  string index_uid = 1;
+  quickwit.common.IndexUid index_uid = 1;
   string split_metadata_list_serialized_json = 2;
 }
 
 message PublishSplitsRequest {
-  string index_uid = 1;
+  quickwit.common.IndexUid index_uid = 1;
   repeated string staged_split_ids = 2;
   repeated string replaced_split_ids = 3;
   optional string index_checkpoint_delta_json_opt = 4;
@@ -225,33 +310,33 @@ message PublishSplitsRequest {
 }
 
 message MarkSplitsForDeletionRequest {
-  string index_uid = 2;
+  quickwit.common.IndexUid index_uid = 2;
   repeated string split_ids = 3;
 }
 
 message DeleteSplitsRequest {
-  string index_uid = 2;
+  quickwit.common.IndexUid index_uid = 2;
   repeated string split_ids = 3;
 }
 
 message AddSourceRequest {
-  string index_uid = 1;
+  quickwit.common.IndexUid index_uid = 1;
   string source_config_json = 2;
 }
 
 message ToggleSourceRequest {
-  string index_uid = 1;
+  quickwit.common.IndexUid index_uid = 1;
   string source_id = 2;
   bool enable = 3;
 }
 
 message DeleteSourceRequest {
-  string index_uid = 1;
+  quickwit.common.IndexUid index_uid = 1;
   string source_id = 2;
 }
 
 message ResetSourceCheckpointRequest {
-  string index_uid = 1;
+  quickwit.common.IndexUid index_uid = 1;
   string source_id = 2;
 }
 
@@ -266,22 +351,20 @@ message DeleteTask {
 }
 
 message DeleteQuery {
-  // Index ID.
-  string index_uid = 1;
+  reserved 4, 5;
+
+  // Index UID.
+  quickwit.common.IndexUid index_uid = 1;
   // If set, restrict search to documents with a `timestamp >= start_timestamp`.
   optional int64 start_timestamp = 2;
   // If set, restrict search to documents with a `timestamp < end_timestamp``.
   optional int64 end_timestamp = 3;
-  // Query text. The query language is that of tantivy.
   // Query AST serialized in JSON
   string query_ast = 6;
-
-  // Reserved field due to deprecation
-  reserved 4, 5;
 }
 
 message UpdateSplitsDeleteOpstampRequest {
-  string index_uid = 1;
+  quickwit.common.IndexUid index_uid = 1;
   repeated string split_ids = 2;
   uint64 delete_opstamp = 3;
 }
@@ -289,7 +372,7 @@ message UpdateSplitsDeleteOpstampRequest {
 message UpdateSplitsDeleteOpstampResponse {}
 
 message LastDeleteOpstampRequest {
-  string index_uid = 1;
+  quickwit.common.IndexUid index_uid = 1;
 }
 
 message LastDeleteOpstampResponse {
@@ -297,13 +380,13 @@ message LastDeleteOpstampResponse {
 }
 
 message ListStaleSplitsRequest {
-  string index_uid = 1;
+  quickwit.common.IndexUid index_uid = 1;
   uint64 delete_opstamp = 2;
   uint64 num_splits = 3;
 }
 
 message ListDeleteTasksRequest {
-  string index_uid = 1;
+  quickwit.common.IndexUid index_uid = 1;
   uint64 opstamp_start = 2;
 }
 
@@ -316,63 +399,70 @@ message ListDeleteTasksResponse {
 //
 
 message OpenShardsRequest {
-  repeated OpenShardsSubrequest subrequests = 1;
+  repeated OpenShardSubrequest subrequests = 1;
 }
 
-message OpenShardsSubrequest {
+message OpenShardSubrequest {
   uint32 subrequest_id = 1;
-  string index_uid = 2;
+  quickwit.common.IndexUid index_uid = 2;
   string source_id = 3;
   quickwit.ingest.ShardId shard_id = 4;
   string leader_id = 5;
   optional string follower_id = 6;
+  quickwit.common.DocMappingUid doc_mapping_uid = 7;
+  optional string publish_token = 8;
 }
 
 message OpenShardsResponse {
-  repeated OpenShardsSubresponse subresponses = 1;
+  repeated OpenShardSubresponse subresponses = 1;
 }
 
-message OpenShardsSubresponse {
+message OpenShardSubresponse {
+  reserved 2, 3;
+
   uint32 subrequest_id = 1;
-  string index_uid = 2;
-  string source_id = 3;
-  repeated quickwit.ingest.Shard opened_shards = 4;
+  quickwit.ingest.Shard open_shard = 4;
 }
 
 message AcquireShardsRequest {
-  repeated AcquireShardsSubrequest subrequests = 1;
-}
-
-message AcquireShardsSubrequest {
-  string index_uid = 1;
+  quickwit.common.IndexUid index_uid = 1;
   string source_id = 2;
   repeated quickwit.ingest.ShardId shard_ids = 3;
   string publish_token = 4;
 }
 
 message AcquireShardsResponse {
-  repeated AcquireShardsSubresponse subresponses = 1;
-}
-
-message AcquireShardsSubresponse {
-  string index_uid = 1;
-  string source_id = 2;
+  // List of acquired shards, in no specific order.
   repeated quickwit.ingest.Shard acquired_shards = 3;
 }
 
 message DeleteShardsRequest {
-  repeated DeleteShardsSubrequest subrequests = 1;
-  // If false, only shards at EOF positions will be deleted.
-  bool force = 2;
-}
-
-message DeleteShardsSubrequest {
-  string index_uid = 1;
+  quickwit.common.IndexUid index_uid = 1;
   string source_id = 2;
   repeated quickwit.ingest.ShardId shard_ids = 3;
+  // If false, only shards at EOF positions will be deleted.
+  bool force = 4;
 }
 
 message DeleteShardsResponse {
+  quickwit.common.IndexUid index_uid = 1;
+  string source_id = 2;
+  // List of shard IDs that were successfully deleted.
+  repeated quickwit.ingest.ShardId successes = 3;
+  // List of shard IDs that could not be deleted because `force` was set to `false` in the request,
+  // and the shards are not at EOF, i.e., not fully indexed.
+  repeated quickwit.ingest.ShardId failures = 4;
+}
+
+message PruneShardsRequest {
+  quickwit.common.IndexUid index_uid = 1;
+  string source_id = 2;
+  // The maximum age of the shards to keep, in seconds.
+  optional uint32 max_age_secs = 5;
+  // The maximum number of the shards to keep. Delete older shards first.
+  optional uint32 max_count = 6;
+  // The interval between two pruning operations, in seconds.
+  optional uint32 interval_secs = 7;
 }
 
 message ListShardsRequest {
@@ -380,7 +470,7 @@ message ListShardsRequest {
 }
 
 message ListShardsSubrequest {
-  string index_uid = 1;
+  quickwit.common.IndexUid index_uid = 1;
   string source_id = 2;
   optional quickwit.ingest.ShardState shard_state = 3;
 }
@@ -390,7 +480,49 @@ message ListShardsResponse {
 }
 
 message ListShardsSubresponse {
-  string index_uid = 1;
+  quickwit.common.IndexUid index_uid = 1;
   string source_id = 2;
   repeated quickwit.ingest.Shard shards = 3;
+}
+
+//
+// Index Template API
+//
+
+message CreateIndexTemplateRequest {
+  string index_template_json = 1;
+  bool overwrite = 2;
+}
+
+message GetIndexTemplateRequest {
+  string template_id = 1;
+}
+
+message GetIndexTemplateResponse {
+  string index_template_json = 1;
+}
+
+message FindIndexTemplateMatchesRequest {
+  repeated string index_ids = 1;
+}
+
+message FindIndexTemplateMatchesResponse {
+  repeated IndexTemplateMatch matches = 1;
+}
+
+message IndexTemplateMatch {
+  string index_id = 1;
+  string template_id = 2;
+  string index_template_json = 3;
+}
+
+message ListIndexTemplatesRequest {
+}
+
+message ListIndexTemplatesResponse {
+  repeated string index_templates_json = 1;
+}
+
+message DeleteIndexTemplatesRequest {
+  repeated string template_ids = 1;
 }

@@ -25,9 +25,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex as TokioMutex;
-use tracing::warn;
 
+use crate::rate_limited_warn;
 use crate::type_map::TypeMap;
+
+const EVENT_SUBSCRIPTION_CALLBACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub trait Event: fmt::Debug + Clone + Send + Sync + 'static {}
 
@@ -40,7 +42,7 @@ pub trait EventSubscriber<E>: Send + Sync + 'static {
 impl<E, F> EventSubscriber<E> for F
 where
     E: Event,
-    F: Fn(E) + Send + Sync + 'static,
+    F: FnMut(E) + Send + Sync + 'static,
 {
     async fn handle_event(&mut self, event: E) {
         (self)(event);
@@ -52,6 +54,7 @@ type EventSubscriptions<E> = HashMap<usize, EventSubscription<E>>;
 /// The event broker makes it possible to
 /// - emit specific local events
 /// - subscribe to these local events
+///
 /// The event broker is not distributed in itself. Only events emitted
 /// locally will be received by the subscribers.
 ///
@@ -69,10 +72,13 @@ struct InnerEventBroker {
 }
 
 impl EventBroker {
-    /// Subscribes to an event type.
-    #[must_use]
-    pub fn subscribe<E>(&self, subscriber: impl EventSubscriber<E>) -> EventSubscriptionHandle
-    where E: Event {
+    // The point of this private method is to allow the public subscribe method to have only one
+    // generic argument and avoid the ugly `::<E, _>` syntax.
+    fn subscribe_aux<E, S>(&self, subscriber: S, with_timeout: bool) -> EventSubscriptionHandle
+    where
+        E: Event,
+        S: EventSubscriber<E> + Send + Sync + 'static,
+    {
         let mut subscriptions = self
             .inner
             .subscriptions
@@ -87,8 +93,11 @@ impl EventBroker {
             .subscription_sequence
             .fetch_add(1, Ordering::Relaxed);
 
+        let subscriber_name = std::any::type_name::<S>();
         let subscription = EventSubscription {
+            subscriber_name,
             subscriber: Arc::new(TokioMutex::new(Box::new(subscriber))),
+            with_timeout,
         };
         let typed_subscriptions = subscriptions
             .get_mut::<EventSubscriptions<E>>()
@@ -111,6 +120,34 @@ impl EventBroker {
         }
     }
 
+    /// Subscribes to an event type.
+    ///
+    /// The callback should be as light as possible.
+    ///
+    /// # Disclaimer
+    ///
+    /// If the callback takes more than `EVENT_SUBSCRIPTION_CALLBACK_TIMEOUT` to execute,
+    /// the callback future will be aborted.
+    #[must_use]
+    pub fn subscribe<E>(&self, subscriber: impl EventSubscriber<E>) -> EventSubscriptionHandle
+    where E: Event {
+        self.subscribe_aux(subscriber, true)
+    }
+
+    /// Subscribes to an event type.
+    ///
+    /// The callback should be as light as possible.
+    #[must_use]
+    pub fn subscribe_without_timeout<E>(
+        &self,
+        subscriber: impl EventSubscriber<E>,
+    ) -> EventSubscriptionHandle
+    where
+        E: Event,
+    {
+        self.subscribe_aux(subscriber, false)
+    }
+
     /// Publishes an event.
     pub fn publish<E>(&self, event: E)
     where E: Event {
@@ -119,29 +156,79 @@ impl EventBroker {
             .subscriptions
             .lock()
             .expect("lock should not be poisoned");
-
         if let Some(typed_subscriptions) = subscriptions.get::<EventSubscriptions<E>>() {
             for subscription in typed_subscriptions.values() {
-                let event = event.clone();
-                let subscriber_clone = subscription.subscriber.clone();
-                let handle_event_fut = async move {
-                    if tokio::time::timeout(Duration::from_secs(1), async {
-                        subscriber_clone.lock().await.handle_event(event).await
-                    })
-                    .await
-                    .is_err()
-                    {
-                        warn!("`{}` event handler timed out", std::any::type_name::<E>());
-                    }
-                };
-                tokio::spawn(handle_event_fut);
+                subscription.trigger(event.clone());
             }
         }
     }
 }
 
 struct EventSubscription<E> {
+    // We put that in the subscription in order to avoid having to take the lock
+    // to access it.
+    subscriber_name: &'static str,
     subscriber: Arc<TokioMutex<Box<dyn EventSubscriber<E>>>>,
+    with_timeout: bool,
+}
+
+impl<E: Event> EventSubscription<E> {
+    /// Call the callback associated with the subscription.
+    fn trigger(&self, event: E) {
+        if self.with_timeout {
+            self.trigger_abort_on_timeout(event);
+        } else {
+            self.trigger_just_log_on_timeout(event)
+        }
+    }
+
+    /// Spawns a task to run the given subscription.
+    ///
+    /// Just logs a warning if it took more than `EVENT_SUBSCRIPTION_CALLBACK_TIMEOUT`
+    /// for the future to execute.
+    fn trigger_just_log_on_timeout(&self, event: E) {
+        let subscriber_name = self.subscriber_name;
+        let subscriber = self.subscriber.clone();
+        // This task is just here to log a warning if the callback takes too long to execute.
+        let log_timeout_task_handle = tokio::task::spawn(async move {
+            tokio::time::sleep(EVENT_SUBSCRIPTION_CALLBACK_TIMEOUT).await;
+            let event_name = std::any::type_name::<E>();
+            rate_limited_warn!(
+                limit_per_min = 10,
+                "{subscriber_name}'s handler for {event_name} did not finished within {}ms",
+                EVENT_SUBSCRIPTION_CALLBACK_TIMEOUT.as_millis()
+            );
+        });
+        tokio::task::spawn(async move {
+            subscriber.lock().await.handle_event(event).await;
+            // The callback has terminated, let's abort the timeout task.
+            log_timeout_task_handle.abort();
+        });
+    }
+
+    /// Spawns a task to run the given subscription.
+    ///
+    /// Aborts the future execution and logs a warning if it takes more than
+    /// `EVENT_SUBSCRIPTION_CALLBACK_TIMEOUT`.
+    fn trigger_abort_on_timeout(&self, event: E) {
+        let subscriber_name = self.subscriber_name;
+        let subscriber = self.subscriber.clone();
+        let fut = async move {
+            if tokio::time::timeout(EVENT_SUBSCRIPTION_CALLBACK_TIMEOUT, async {
+                subscriber.lock().await.handle_event(event).await
+            })
+            .await
+            .is_err()
+            {
+                let event_name = std::any::type_name::<E>();
+                rate_limited_warn!(
+                    limit_per_min = 10,
+                    "{subscriber_name}'s handler for {event_name} timed out, abort"
+                );
+            }
+        };
+        tokio::task::spawn(fut);
+    }
 }
 
 #[derive(Clone)]

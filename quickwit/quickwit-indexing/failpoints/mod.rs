@@ -46,18 +46,18 @@ use quickwit_common::rand::append_random_suffix;
 use quickwit_common::split_file;
 use quickwit_common::temp_dir::TempDirectory;
 use quickwit_indexing::actors::MergeExecutor;
-use quickwit_indexing::merge_policy::MergeOperation;
+use quickwit_indexing::merge_policy::{MergeOperation, MergeTask};
 use quickwit_indexing::models::MergeScratch;
 use quickwit_indexing::{get_tantivy_directory_from_split_bundle, TestSandbox};
 use quickwit_metastore::{
     ListSplitsQuery, ListSplitsRequestExt, MetastoreServiceStreamSplitsExt, SplitMetadata,
     SplitState,
 };
-use quickwit_proto::indexing::IndexingPipelineId;
+use quickwit_proto::indexing::MergePipelineId;
 use quickwit_proto::metastore::{ListSplitsRequest, MetastoreService};
-use quickwit_proto::types::{IndexUid, PipelineUid};
+use quickwit_proto::types::{IndexUid, NodeId};
 use serde_json::Value as JsonValue;
-use tantivy::{Directory, Inventory};
+use tantivy::Directory;
 
 #[tokio::test]
 async fn test_failpoint_no_failure() -> anyhow::Result<()> {
@@ -188,7 +188,7 @@ async fn aux_test_failpoints() -> anyhow::Result<()> {
     test_index_builder.add_documents(batch_2).await?;
     let query = ListSplitsQuery::for_index(test_index_builder.index_uid())
         .with_split_state(SplitState::Published);
-    let list_splits_request = ListSplitsRequest::try_from_list_splits_query(query).unwrap();
+    let list_splits_request = ListSplitsRequest::try_from_list_splits_query(&query).unwrap();
     let mut splits = test_index_builder
         .metastore()
         .list_splits(list_splits_request)
@@ -211,7 +211,7 @@ async fn aux_test_failpoints() -> anyhow::Result<()> {
     Ok(())
 }
 
-const TEST_TEXT: &'static str = r#"His sole child, my lord, and bequeathed to my
+const TEST_TEXT: &str = r#"His sole child, my lord, and bequeathed to my
 overlooking. I have those hopes of her good that
 her education promises; her dispositions she
 inherits, which makes fair gifts fairer; for where
@@ -268,7 +268,7 @@ async fn test_merge_executor_controlled_directory_kill_switch() -> anyhow::Resul
     }
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    let mut metastore = test_index_builder.metastore();
+    let metastore = test_index_builder.metastore();
     let split_metadatas: Vec<SplitMetadata> = metastore
         .list_splits(ListSplitsRequest::try_from_index_uid(test_index_builder.index_uid()).unwrap())
         .await?
@@ -290,20 +290,18 @@ async fn test_merge_executor_controlled_directory_kill_switch() -> anyhow::Resul
 
         tantivy_dirs.push(get_tantivy_directory_from_split_bundle(&dest_filepath).unwrap());
     }
-    let merge_ops_inventory = Inventory::new();
-    let merge_operation =
-        merge_ops_inventory.track(MergeOperation::new_merge_operation(split_metadatas));
+    let merge_operation = MergeOperation::new_merge_operation(split_metadatas);
+    let merge_task = MergeTask::from_merge_operation_for_test(merge_operation);
     let merge_scratch = MergeScratch {
-        merge_operation,
+        merge_task,
         merge_scratch_directory,
         downloaded_splits_directory,
         tantivy_dirs,
     };
-    let pipeline_id = IndexingPipelineId {
+    let pipeline_id = MergePipelineId {
+        node_id: NodeId::from("test-node"),
         index_uid: IndexUid::new_with_random_ulid(index_id),
         source_id: "test-source".to_string(),
-        node_id: "test-node".to_string(),
-        pipeline_uid: PipelineUid::default(),
     };
 
     let universe = test_index_builder.universe();

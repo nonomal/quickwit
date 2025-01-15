@@ -1,13 +1,14 @@
 [package]
 name = "quickwit-search"
-version = "0.7.0"
-authors = ["Quickwit, Inc. <hello@quickwit.io>"]
-edition = "2021"
-license = "AGPL-3.0-or-later"                           # For a commercial, license, contact hello@quickwit.io
-description = "Quickwit's search logic"
-repository = "https://github.com/quickwit-oss/quickwit"
-homepage = "https://quickwit.io/"
-documentation = "https://quickwit.io/docs/"
+description = "Distributed search"
+
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
@@ -18,26 +19,21 @@ bytesize = { workspace = true }
 fnv = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
-hyper = { workspace = true }
 itertools = { workspace = true }
-lru = { workspace = true }
 mockall = { workspace = true }
 once_cell = { workspace = true }
-opentelemetry = { workspace = true }
 postcard = { workspace = true }
 prost = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_with = { workspace = true }
 tantivy = { workspace = true }
+tantivy-fst = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
-tokio-util = { workspace = true }
 tower = { workspace = true }
 tracing = { workspace = true }
-tracing-opentelemetry = { workspace = true }
 ttl_cache = { workspace = true }
 ulid = { workspace = true }
 utoipa = { workspace = true }
@@ -54,11 +50,9 @@ quickwit-storage = { workspace = true }
 
 [dev-dependencies]
 assert-json-diff = { workspace = true }
-chitchat = { workspace = true }
 proptest = { workspace = true }
+rand = { workspace = true }
 serde_json = { workspace = true }
-tempfile = { workspace = true }
-typetag = { workspace = true }
 
 quickwit-indexing = { workspace = true, features = ["testsuite"] }
 quickwit-metastore = { workspace = true, features = ["testsuite"] }
@@ -67,3 +61,4 @@ quickwit-storage = { workspace = true, features = ["testsuite"] }
 
 [features]
 testsuite = []
+ci-test = []

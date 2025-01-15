@@ -28,6 +28,7 @@ use crate::spawn_builder::{SpawnBuilder, SpawnContext};
 use crate::{Actor, ActorExitStatus, Command, Inbox, Mailbox, QueueCapacity};
 
 /// Universe serves as the top-level context in which Actor can be spawned.
+///
 /// It is *not* a singleton. A typical application will usually have only one universe hosting all
 /// of the actors but it is not a requirement.
 ///
@@ -87,6 +88,16 @@ impl Universe {
 
     pub fn get_one<A: Actor>(&self) -> Option<Mailbox<A>> {
         self.spawn_ctx.registry.get_one::<A>()
+    }
+
+    pub fn get_or_spawn_one<A: Actor + Default>(&self) -> Mailbox<A> {
+        if let Some(actor_mailbox) = self.spawn_ctx.registry.get_one::<A>() {
+            actor_mailbox
+        } else {
+            let actor_default = A::default();
+            let (mailbox, _handler) = self.spawn_builder().spawn(actor_default);
+            mailbox
+        }
     }
 
     pub async fn observe(&self, timeout: Duration) -> Vec<ActorObservation> {
@@ -192,7 +203,7 @@ mod tests {
             ctx: &ActorContext<Self>,
         ) -> Result<(), ActorExitStatus> {
             self.count += 1;
-            ctx.schedule_self_msg(Duration::from_secs(60), Loop).await;
+            ctx.schedule_self_msg(Duration::from_secs(60), Loop);
             Ok(())
         }
     }

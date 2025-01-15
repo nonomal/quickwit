@@ -26,6 +26,7 @@ use warp::hyper::StatusCode;
 use warp::reply::with_status;
 use warp::{Filter, Rejection};
 
+use crate::rest::recover_fn;
 use crate::with_arg;
 
 #[derive(utoipa::OpenApi)]
@@ -50,6 +51,7 @@ fn liveness_handler(
         .and(with_arg(indexer_service_opt))
         .and(with_arg(janitor_service_opt))
         .then(get_liveness)
+        .recover(recover_fn)
 }
 
 fn readiness_handler(
@@ -59,6 +61,7 @@ fn readiness_handler(
         .and(warp::get())
         .and(with_arg(cluster))
         .then(get_readiness)
+        .recover(recover_fn)
 }
 
 #[utoipa::path(
@@ -79,13 +82,13 @@ async fn get_liveness(
 
     if let Some(indexer_service) = indexer_service_opt {
         if !indexer_service.ask(Healthz).await.unwrap_or(false) {
-            error!("the indexer service is unhealthy");
+            error!("indexer service is unhealthy");
             is_live = false;
         }
     }
     if let Some(janitor_service) = janitor_service_opt {
         if !janitor_service.ask(Healthz).await.unwrap_or(false) {
-            error!("the janitor service is unhealthy");
+            error!("janitor service is unhealthy");
             is_live = false;
         }
     }

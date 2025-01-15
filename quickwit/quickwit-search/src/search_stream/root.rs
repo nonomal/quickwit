@@ -135,7 +135,9 @@ mod tests {
     use quickwit_common::ServiceStream;
     use quickwit_indexing::MockSplitBuilder;
     use quickwit_metastore::{IndexMetadata, ListSplitsResponseExt};
-    use quickwit_proto::metastore::{IndexMetadataResponse, ListSplitsResponse};
+    use quickwit_proto::metastore::{
+        IndexMetadataResponse, ListSplitsResponse, MockMetastoreService,
+    };
     use quickwit_proto::search::OutputFormat;
     use quickwit_query::query_ast::qast_json_helper;
     use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -152,11 +154,11 @@ mod tests {
             output_format: OutputFormat::Csv as i32,
             ..Default::default()
         };
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         let index_metadata = IndexMetadata::for_test("test-index", "ram:///test-index");
         let index_uid = index_metadata.index_uid.clone();
         mock_metastore.expect_index_metadata().returning(move |_| {
-            Ok(IndexMetadataResponse::try_from_index_metadata(index_metadata.clone()).unwrap())
+            Ok(IndexMetadataResponse::try_from_index_metadata(&index_metadata).unwrap())
         });
         mock_metastore.expect_list_splits().returning(move |_| {
             let splits = vec![MockSplitBuilder::new("split1")
@@ -188,7 +190,7 @@ mod tests {
         let cluster_client = ClusterClient::new(search_job_placer.clone());
         let result: Vec<Bytes> = root_search_stream(
             request,
-            MetastoreServiceClient::from(mock_metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             cluster_client,
         )
         .await?
@@ -201,7 +203,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_root_search_stream_single_split_partitionned() -> anyhow::Result<()> {
+    async fn test_root_search_stream_single_split_partitioned() -> anyhow::Result<()> {
         let request = quickwit_proto::search::SearchStreamRequest {
             index_id: "test-index".to_string(),
             query_ast: qast_json_helper("test", &["body"]),
@@ -210,11 +212,11 @@ mod tests {
             partition_by_field: Some("timestamp".to_string()),
             ..Default::default()
         };
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         let index_metadata = IndexMetadata::for_test("test-index", "ram:///test-index");
         let index_uid = index_metadata.index_uid.clone();
         mock_metastore.expect_index_metadata().returning(move |_| {
-            Ok(IndexMetadataResponse::try_from_index_metadata(index_metadata.clone()).unwrap())
+            Ok(IndexMetadataResponse::try_from_index_metadata(&index_metadata).unwrap())
         });
         mock_metastore.expect_list_splits().returning(move |_| {
             let splits = vec![MockSplitBuilder::new("split1")
@@ -246,7 +248,7 @@ mod tests {
         let cluster_client = ClusterClient::new(search_job_placer.clone());
         let stream = root_search_stream(
             request,
-            MetastoreServiceClient::from(mock_metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             cluster_client,
         )
         .await?;
@@ -266,11 +268,11 @@ mod tests {
             output_format: OutputFormat::Csv as i32,
             ..Default::default()
         };
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         let index_metadata = IndexMetadata::for_test("test-index", "ram:///test-index");
         let index_uid = index_metadata.index_uid.clone();
         mock_metastore.expect_index_metadata().returning(move |_| {
-            Ok(IndexMetadataResponse::try_from_index_metadata(index_metadata.clone()).unwrap())
+            Ok(IndexMetadataResponse::try_from_index_metadata(&index_metadata).unwrap())
         });
         mock_metastore.expect_list_splits().returning(move |_| {
             let splits = vec![
@@ -315,7 +317,7 @@ mod tests {
         let cluster_client = ClusterClient::new(search_job_placer.clone());
         let stream = root_search_stream(
             request,
-            MetastoreServiceClient::from(mock_metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             cluster_client,
         )
         .await?;
@@ -327,11 +329,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_root_search_stream_with_invalid_query() -> anyhow::Result<()> {
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         let index_metadata = IndexMetadata::for_test("test-index", "ram:///test-index");
         let index_uid = index_metadata.index_uid.clone();
         mock_metastore.expect_index_metadata().returning(move |_| {
-            Ok(IndexMetadataResponse::try_from_index_metadata(index_metadata.clone()).unwrap())
+            Ok(IndexMetadataResponse::try_from_index_metadata(&index_metadata).unwrap())
         });
         mock_metastore.expect_list_splits().returning(move |_| {
             let splits = vec![MockSplitBuilder::new("split")
@@ -343,7 +345,7 @@ mod tests {
 
         let searcher_pool = searcher_pool_for_test([("127.0.0.1:1001", MockSearchService::new())]);
         let search_job_placer = SearchJobPlacer::new(searcher_pool);
-        let metastore = MetastoreServiceClient::from(mock_metastore);
+        let metastore = MetastoreServiceClient::from_mock(mock_metastore);
         assert!(root_search_stream(
             quickwit_proto::search::SearchStreamRequest {
                 index_id: "test-index".to_string(),

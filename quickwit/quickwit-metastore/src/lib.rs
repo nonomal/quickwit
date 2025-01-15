@@ -26,7 +26,7 @@
 //! metastore:
 //! - file-backed metastore
 //! - PostgreSQL metastore
-//! etc.
+//! - etc.
 
 #[allow(missing_docs)]
 pub mod checkpoint;
@@ -43,31 +43,32 @@ use std::ops::Range;
 
 pub use error::MetastoreResolverError;
 pub use metastore::control_plane_metastore::ControlPlaneMetastore;
-pub use metastore::file_backed_metastore::FileBackedMetastore;
-pub(crate) use metastore::index_metadata::serialize::{IndexMetadataV0_7, VersionedIndexMetadata};
+pub use metastore::file_backed::FileBackedMetastore;
+pub(crate) use metastore::index_metadata::serialize::{IndexMetadataV0_8, VersionedIndexMetadata};
 #[cfg(feature = "postgres")]
-pub use metastore::postgresql_metastore::PostgresqlMetastore;
+pub use metastore::postgres::PostgresqlMetastore;
 pub use metastore::{
-    file_backed_metastore, AddSourceRequestExt, CreateIndexRequestExt, IndexMetadata,
-    IndexMetadataResponseExt, ListIndexesMetadataResponseExt, ListSplitsQuery,
-    ListSplitsRequestExt, ListSplitsResponseExt, MetastoreServiceExt,
+    file_backed, AddSourceRequestExt, CreateIndexRequestExt, CreateIndexResponseExt, IndexMetadata,
+    IndexMetadataResponseExt, IndexesMetadataResponseExt, ListIndexesMetadataResponseExt,
+    ListSplitsQuery, ListSplitsRequestExt, ListSplitsResponseExt, MetastoreServiceExt,
     MetastoreServiceStreamSplitsExt, PublishSplitsRequestExt, StageSplitsRequestExt,
+    UpdateIndexRequestExt,
 };
 pub use metastore_factory::{MetastoreFactory, UnsupportedMetastore};
 pub use metastore_resolver::MetastoreResolver;
 use quickwit_common::is_disjoint;
 use quickwit_doc_mapper::tag_pruning::TagFilterAst;
 pub use split_metadata::{Split, SplitInfo, SplitMaturity, SplitMetadata, SplitState};
-pub(crate) use split_metadata_version::{SplitMetadataV0_7, VersionedSplitMetadata};
+pub(crate) use split_metadata_version::{SplitMetadataV0_8, VersionedSplitMetadata};
 
 #[derive(utoipa::OpenApi)]
 #[openapi(components(schemas(
+    IndexMetadataV0_8,
     Split,
+    SplitMetadataV0_8,
     SplitState,
     VersionedIndexMetadata,
-    IndexMetadataV0_7,
     VersionedSplitMetadata,
-    SplitMetadataV0_7,
 )))]
 /// Schema used for the OpenAPI generation which are apart of this crate.
 pub struct MetastoreApiSchemas;

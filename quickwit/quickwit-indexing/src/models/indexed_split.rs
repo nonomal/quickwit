@@ -21,16 +21,17 @@ use std::fmt;
 use std::path::Path;
 
 use quickwit_common::io::IoControls;
+use quickwit_common::metrics::GaugeGuard;
 use quickwit_common::temp_dir::TempDirectory;
 use quickwit_metastore::checkpoint::IndexCheckpointDelta;
 use quickwit_proto::indexing::IndexingPipelineId;
-use quickwit_proto::types::{IndexUid, PublishToken};
+use quickwit_proto::types::{DocMappingUid, IndexUid, PublishToken};
 use tantivy::directory::MmapDirectory;
-use tantivy::{IndexBuilder, TrackedObject};
+use tantivy::IndexBuilder;
 use tracing::{instrument, Span};
 
 use crate::controlled_directory::ControlledDirectory;
-use crate::merge_policy::MergeOperation;
+use crate::merge_policy::MergeTask;
 use crate::models::{PublishLock, SplitAttrs};
 use crate::new_split_id;
 
@@ -81,6 +82,7 @@ impl IndexedSplitBuilder {
         pipeline_id: IndexingPipelineId,
         partition_id: u64,
         last_delete_opstamp: u64,
+        doc_mapping_uid: DocMappingUid,
         scratch_directory: TempDirectory,
         index_builder: IndexBuilder,
         io_controls: IoControls,
@@ -101,7 +103,10 @@ impl IndexedSplitBuilder {
             index_builder.single_segment_index_writer(controlled_directory.clone(), 15_000_000)?;
         Ok(Self {
             split_attrs: SplitAttrs {
-                pipeline_id,
+                node_id: pipeline_id.node_id,
+                index_uid: pipeline_id.index_uid,
+                source_id: pipeline_id.source_id,
+                doc_mapping_uid,
                 partition_id,
                 split_id,
                 num_docs: 0,
@@ -120,10 +125,9 @@ impl IndexedSplitBuilder {
     #[instrument(name="serialize_split",
         skip_all,
         fields(
-            index_id=%self.split_attrs.pipeline_id.index_uid.index_id(),
-            source_id=%self.split_attrs.pipeline_id.source_id,
-            node_id=%self.split_attrs.pipeline_id.node_id,
-            pipeline_uid=%self.split_attrs.pipeline_id.pipeline_uid,
+            node_id=%self.split_attrs.node_id,
+            index_uid=%self.split_attrs.index_uid,
+            source_id=%self.split_attrs.source_id,
             split_id=%self.split_attrs.split_id,
             partition_id=%self.split_attrs.partition_id,
             num_docs=%self.split_attrs.num_docs,
@@ -157,11 +161,11 @@ pub struct IndexedSplitBatch {
     pub checkpoint_delta_opt: Option<IndexCheckpointDelta>,
     pub publish_lock: PublishLock,
     pub publish_token_opt: Option<PublishToken>,
-    /// A [`MergeOperation`] tracked by either the `MergePlanner` or the `DeleteTaskPlanner`
+    /// A [`MergeTask`] tracked by either the `MergePlanner` or the `DeleteTaskPlanner`
     /// in the `MergePipeline` or `DeleteTaskPipeline`.
     /// See planners docs to understand the usage.
     /// If `None`, the split batch was built in the `IndexingPipeline`.
-    pub merge_operation_opt: Option<TrackedObject<MergeOperation>>,
+    pub merge_task_opt: Option<MergeTask>,
     pub batch_parent_span: Span,
 }
 
@@ -183,9 +187,11 @@ pub struct IndexedSplitBatchBuilder {
     pub publish_token_opt: Option<PublishToken>,
     pub commit_trigger: CommitTrigger,
     pub batch_parent_span: Span,
+    pub memory_usage: GaugeGuard<'static>,
+    pub _split_builders_guard: GaugeGuard<'static>,
 }
 
-/// Sends notifications to the Publisher that the last batch of splits was emtpy.
+/// Sends notifications to the Publisher that the last batch of splits was empty.
 #[derive(Debug)]
 pub struct EmptySplit {
     pub index_uid: IndexUid,

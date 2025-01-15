@@ -19,77 +19,26 @@
 
 pub(crate) mod serialize;
 
-use std::collections::BTreeSet;
-use std::num::NonZeroU32;
+use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::{ensure, Context};
 use bytesize::ByteSize;
 use chrono::Utc;
 use cron::Schedule;
 use humantime::parse_duration;
 use quickwit_common::uri::Uri;
-use quickwit_doc_mapper::{
-    DefaultDocMapper, DefaultDocMapperBuilder, DocMapper, FieldMappingEntry, Mode, ModeType,
-    QuickwitJsonOptions, TokenizerEntry,
-};
+use quickwit_doc_mapper::{DocMapper, DocMapperBuilder, DocMapping};
 use quickwit_proto::types::IndexId;
 use serde::{Deserialize, Serialize};
-pub use serialize::load_index_config_from_user_config;
+pub use serialize::{load_index_config_from_user_config, load_index_config_update};
+use siphasher::sip::SipHasher;
+use tracing::warn;
 
 use crate::index_config::serialize::VersionedIndexConfig;
-use crate::merge_policy_config::{MergePolicyConfig, StableLogMergePolicyConfig};
-use crate::TestableForRegression;
-
-// Note(fmassot): `DocMapping` is a struct only used for
-// serialization/deserialization of `DocMapper` parameters.
-// This is partly a duplicate of the `DefaultDocMapper` and
-// can be viewed as a temporary hack for 0.2 release before
-// refactoring.
-#[quickwit_macros::serde_multikey]
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct DocMapping {
-    #[serde(default)]
-    #[schema(value_type = Vec<FieldMappingEntryForSerialization>)]
-    /// The mapping of the index schema fields.
-    ///
-    /// This defines the name, type and other information about the field(s).
-    ///
-    /// Properties are determined by the specified type, for more information
-    /// please see: <https://quickwit.io/docs/configuration/index-config#field-types>
-    pub field_mappings: Vec<FieldMappingEntry>,
-    #[schema(value_type = Vec<String>)]
-    #[serde(default)]
-    pub tag_fields: BTreeSet<String>,
-    #[serde(default)]
-    pub store_source: bool,
-    #[serde(default)]
-    pub index_field_presence: bool,
-    #[serde(default)]
-    pub timestamp_field: Option<String>,
-    #[serde_multikey(
-        deserializer = Mode::from_parts,
-        serializer = Mode::into_parts,
-        fields = (
-            #[serde(default)]
-            mode: ModeType,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            dynamic_mapping: Option<QuickwitJsonOptions>
-        ),
-    )]
-    pub mode: Mode,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub partition_key: Option<String>,
-    #[schema(value_type = u32)]
-    #[serde(default = "DefaultDocMapper::default_max_num_partitions")]
-    pub max_num_partitions: NonZeroU32,
-    #[serde(default)]
-    pub tokenizers: Vec<TokenizerEntry>,
-}
+use crate::merge_policy_config::MergePolicyConfig;
 
 #[derive(Clone, Debug, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -97,19 +46,22 @@ pub struct IndexingResources {
     #[schema(value_type = String, default = "2 GB")]
     #[serde(default = "IndexingResources::default_heap_size")]
     pub heap_size: ByteSize,
-    /// Sets the maximum write IO throughput in bytes/sec for the merge and delete pipelines.
-    /// The IO limit is applied both to the downloader and to the merge executor.
-    /// On hardware where IO is limited, this parameter can help limiting the impact of
-    /// merges/deletes on indexing.
+    // DEPRECATED: See #4439
     #[schema(value_type = String)]
     #[serde(default)]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_merge_write_throughput: Option<ByteSize>,
+    #[serde(skip_serializing)]
+    max_merge_write_throughput: Option<ByteSize>,
 }
 
 impl PartialEq for IndexingResources {
     fn eq(&self, other: &Self) -> bool {
         self.heap_size == other.heap_size
+    }
+}
+
+impl Hash for IndexingResources {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.heap_size.hash(state);
     }
 }
 
@@ -125,6 +77,16 @@ impl IndexingResources {
             ..Default::default()
         }
     }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.max_merge_write_throughput.is_some() {
+            warn!(
+                "`max_merge_write_throughput` is deprecated and will be removed in a future \
+                 version. See #4439. A global limit now exists in indexer configuration."
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for IndexingResources {
@@ -136,7 +98,7 @@ impl Default for IndexingResources {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Hash, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IndexingSettings {
     #[schema(default = 60)]
@@ -215,27 +177,20 @@ pub struct SearchSettings {
 #[serde(deny_unknown_fields)]
 pub struct RetentionPolicy {
     /// Duration of time for which the splits should be retained, expressed in a human-friendly way
-    /// (`1 hour`, `3 days`, `a week`, ...).
+    /// (`1 hour`, `3 days`, `1 week`, ...).
     #[serde(rename = "period")]
-    retention_period: String,
+    pub retention_period: String,
 
     /// Defines the frequency at which the retention policy is evaluated and applied, expressed in
     /// a human-friendly way (`hourly`, `daily`, ...) or as a cron expression (`0 0 * * * *`,
     /// `0 0 0 * * *`).
     #[serde(default = "RetentionPolicy::default_schedule")]
     #[serde(rename = "schedule")]
-    evaluation_schedule: String,
+    pub evaluation_schedule: String,
 }
 
 impl RetentionPolicy {
-    pub fn new(retention_period: String, evaluation_schedule: String) -> Self {
-        Self {
-            retention_period,
-            evaluation_schedule,
-        }
-    }
-
-    fn default_schedule() -> String {
+    pub fn default_schedule() -> String {
         "hourly".to_string()
     }
 
@@ -271,7 +226,7 @@ impl RetentionPolicy {
         Ok(duration)
     }
 
-    fn validate(&self) -> anyhow::Result<()> {
+    pub(super) fn validate(&self) -> anyhow::Result<()> {
         self.retention_period()?;
         self.evaluation_schedule()?;
         Ok(())
@@ -302,14 +257,23 @@ pub struct IndexConfig {
     pub doc_mapping: DocMapping,
     pub indexing_settings: IndexingSettings,
     pub search_settings: SearchSettings,
-    pub retention_policy: Option<RetentionPolicy>,
+    pub retention_policy_opt: Option<RetentionPolicy>,
 }
 
 impl IndexConfig {
+    /// Return a fingerprint of parameters relevant for indexers
+    pub fn indexing_params_fingerprint(&self) -> u64 {
+        let mut hasher = SipHasher::new();
+        self.doc_mapping.doc_mapping_uid.hash(&mut hasher);
+        self.indexing_settings.hash(&mut hasher);
+        hasher.finish()
+    }
+
     #[cfg(any(test, feature = "testsuite"))]
     pub fn for_test(index_id: &str, index_uri: &str) -> Self {
         let index_uri = Uri::from_str(index_uri).unwrap();
         let doc_mapping_json = r#"{
+            "doc_mapping_uid": "00000000000000000000000000",
             "mode": "lenient",
             "field_mappings": [
                 {
@@ -387,13 +351,22 @@ impl IndexConfig {
             doc_mapping,
             indexing_settings,
             search_settings,
-            retention_policy: Default::default(),
+            retention_policy_opt: Default::default(),
         }
     }
 }
 
-impl TestableForRegression for IndexConfig {
+#[cfg(any(test, feature = "testsuite"))]
+impl crate::TestableForRegression for IndexConfig {
     fn sample_for_regression() -> Self {
+        use std::collections::BTreeSet;
+        use std::num::NonZeroU32;
+
+        use quickwit_doc_mapper::Mode;
+        use quickwit_proto::types::DocMappingUid;
+
+        use crate::merge_policy_config::StableLogMergePolicyConfig;
+
         let tenant_id_mapping = serde_json::from_str(
             r#"{
                 "name": "tenant_id",
@@ -436,28 +409,27 @@ impl TestableForRegression for IndexConfig {
         )
         .unwrap();
         let doc_mapping = DocMapping {
-            index_field_presence: true,
+            doc_mapping_uid: DocMappingUid::for_test(1),
+            mode: Mode::default(),
             field_mappings: vec![
                 tenant_id_mapping,
                 timestamp_mapping,
                 log_level_mapping,
                 message_mapping,
             ],
-            tag_fields: ["tenant_id", "log_level"]
-                .into_iter()
-                .map(|tag_field| tag_field.to_string())
-                .collect::<BTreeSet<String>>(),
-            store_source: true,
-            mode: Mode::default(),
+            timestamp_field: Some("timestamp".to_string()),
+            tag_fields: BTreeSet::from_iter(["tenant_id".to_string(), "log_level".to_string()]),
             partition_key: Some("tenant_id".to_string()),
             max_num_partitions: NonZeroU32::new(100).unwrap(),
-            timestamp_field: Some("timestamp".to_string()),
+            index_field_presence: true,
+            store_document_size: false,
+            store_source: true,
             tokenizers: vec![tokenizer],
         };
-        let retention_policy = Some(RetentionPolicy::new(
-            "90 days".to_string(),
-            "daily".to_string(),
-        ));
+        let retention_policy = Some(RetentionPolicy {
+            retention_period: "90 days".to_string(),
+            evaluation_schedule: "daily".to_string(),
+        });
         let stable_log_config = StableLogMergePolicyConfig {
             merge_factor: 9,
             max_merge_factor: 11,
@@ -483,61 +455,65 @@ impl TestableForRegression for IndexConfig {
             index_uri: Uri::for_test("s3://quickwit-indexes/my-index"),
             doc_mapping,
             indexing_settings,
-            retention_policy,
+            retention_policy_opt: retention_policy,
             search_settings,
         }
     }
 
-    fn test_equality(&self, other: &Self) {
+    fn assert_equality(&self, other: &Self) {
         assert_eq!(self.index_id, other.index_id);
         assert_eq!(self.index_uri, other.index_uri);
-        assert_eq!(
-            self.doc_mapping
-                .field_mappings
-                .iter()
-                .map(|field_mapping| &field_mapping.name)
-                .collect::<Vec<_>>(),
-            other
-                .doc_mapping
-                .field_mappings
-                .iter()
-                .map(|field_mapping| &field_mapping.name)
-                .collect::<Vec<_>>(),
-        );
-        assert_eq!(self.doc_mapping.tag_fields, other.doc_mapping.tag_fields,);
-        assert_eq!(
-            self.doc_mapping.store_source,
-            other.doc_mapping.store_source,
-        );
+        assert_eq!(self.doc_mapping, other.doc_mapping);
         assert_eq!(self.indexing_settings, other.indexing_settings);
         assert_eq!(self.search_settings, other.search_settings);
     }
 }
 
-/// Builds and returns the doc mapper associated with index.
+/// Builds and returns the doc mapper associated with an index.
 pub fn build_doc_mapper(
     doc_mapping: &DocMapping,
     search_settings: &SearchSettings,
-) -> anyhow::Result<Arc<dyn DocMapper>> {
-    let builder = DefaultDocMapperBuilder {
-        store_source: doc_mapping.store_source,
-        index_field_presence: doc_mapping.index_field_presence,
+) -> anyhow::Result<Arc<DocMapper>> {
+    let builder = DocMapperBuilder {
+        doc_mapping: doc_mapping.clone(),
         default_search_fields: search_settings.default_search_fields.clone(),
-        timestamp_field: doc_mapping.timestamp_field.clone(),
-        field_mappings: doc_mapping.field_mappings.clone(),
-        tag_fields: doc_mapping.tag_fields.iter().cloned().collect(),
-        mode: doc_mapping.mode.clone(),
-        partition_key: doc_mapping.partition_key.clone(),
-        max_num_partitions: doc_mapping.max_num_partitions,
-        tokenizers: doc_mapping.tokenizers.clone(),
+        legacy_type_tag: None,
     };
     Ok(Arc::new(builder.try_build()?))
+}
+
+/// Validates the objects that make up an index configuration. This is a "free" function as opposed
+/// to a method on `IndexConfig` so we can reuse it for validating index templates.
+pub(super) fn validate_index_config(
+    doc_mapping: &DocMapping,
+    indexing_settings: &IndexingSettings,
+    search_settings: &SearchSettings,
+    retention_policy_opt: &Option<RetentionPolicy>,
+) -> anyhow::Result<()> {
+    // Note: this needs a deep refactoring to separate the doc mapping configuration,
+    // and doc mapper implementations.
+    // TODO see if we should store the byproducton the IndexConfig.
+    build_doc_mapper(doc_mapping, search_settings)?;
+
+    indexing_settings.merge_policy.validate()?;
+    indexing_settings.resources.validate()?;
+
+    if let Some(retention_policy) = retention_policy_opt {
+        retention_policy.validate()?;
+
+        ensure!(
+            doc_mapping.timestamp_field.is_some(),
+            "retention policy requires a timestamp field, but doc mapping does not declare one"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
 
     use cron::TimeUnitSpec;
+    use quickwit_doc_mapper::ModeType;
 
     use super::*;
     use crate::merge_policy_config::MergePolicyConfig;
@@ -587,7 +563,7 @@ mod tests {
             evaluation_schedule: "daily".to_string(),
         };
         assert_eq!(
-            index_config.retention_policy.unwrap(),
+            index_config.retention_policy_opt.unwrap(),
             expected_retention_policy
         );
         assert!(index_config.doc_mapping.store_source);
@@ -599,7 +575,7 @@ mod tests {
         assert_eq!(index_config.indexing_settings.commit_timeout_secs, 61);
         assert_eq!(
             index_config.indexing_settings.merge_policy,
-            MergePolicyConfig::StableLog(StableLogMergePolicyConfig {
+            MergePolicyConfig::StableLog(crate::StableLogMergePolicyConfig {
                 merge_factor: 9,
                 max_merge_factor: 11,
                 maturation_period: Duration::from_secs(48 * 3600),
@@ -702,7 +678,7 @@ mod tests {
     #[should_panic(expected = "empty URI")]
     fn test_config_validates_uris() {
         let config_yaml = r#"
-            version: 0.7
+            version: 0.8
             index_id: hdfs-logs
             index_uri: ''
             doc_mapping: {}
@@ -713,7 +689,7 @@ mod tests {
     #[test]
     fn test_minimal_index_config_default_dynamic() {
         let config_yaml = r#"
-            version: 0.7
+            version: 0.8
             index_id: hdfs-logs
             index_uri: "s3://my-index"
             doc_mapping: {}
@@ -733,7 +709,7 @@ mod tests {
     #[test]
     fn test_index_config_with_malformed_maturation_duration() {
         let config_yaml = r#"
-            version: 0.7
+            version: 0.8
             index_id: hdfs-logs
             index_uri: "s3://my-index"
             doc_mapping: {}

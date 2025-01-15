@@ -30,6 +30,8 @@ use itertools::Itertools;
 use once_cell::sync::OnceCell;
 use quickwit_actors::{Actor, ActorContext, ActorExitStatus, Handler, Mailbox, QueueCapacity};
 use quickwit_common::pubsub::EventBroker;
+use quickwit_common::spawn_named_task;
+use quickwit_config::RetentionPolicy;
 use quickwit_metastore::checkpoint::IndexCheckpointDelta;
 use quickwit_metastore::{SplitMetadata, StageSplitsRequestExt};
 use quickwit_proto::metastore::{MetastoreService, MetastoreServiceClient, StageSplitsRequest};
@@ -37,14 +39,13 @@ use quickwit_proto::search::{ReportSplit, ReportSplitsRequest};
 use quickwit_proto::types::{IndexUid, PublishToken};
 use quickwit_storage::SplitPayloadBuilder;
 use serde::Serialize;
-use tantivy::TrackedObject;
 use tokio::sync::oneshot::Sender;
 use tokio::sync::{oneshot, Semaphore, SemaphorePermit};
-use tracing::{info, instrument, warn, Instrument, Span};
+use tracing::{debug, info, instrument, warn, Instrument, Span};
 
 use crate::actors::sequencer::{Sequencer, SequencerCommand};
 use crate::actors::Publisher;
-use crate::merge_policy::{MergeOperation, MergePolicy};
+use crate::merge_policy::{MergePolicy, MergeTask};
 use crate::metrics::INDEXER_METRICS;
 use crate::models::{
     create_split_metadata, EmptySplit, PackagedSplit, PackagedSplitBatch, PublishLock, SplitsUpdate,
@@ -68,6 +69,7 @@ pub enum UploaderType {
 }
 
 /// [`SplitsUpdateMailbox`] wraps either a [`Mailbox<Sequencer>`] or [`Mailbox<Publisher>`].
+///
 /// It makes it possible to send a [`SplitsUpdate`] either to the [`Sequencer`] or directly
 /// to [`Publisher`]. It is used in combination with `SplitsUpdateSender` that will do the send.
 ///
@@ -165,6 +167,7 @@ pub struct Uploader {
     uploader_type: UploaderType,
     metastore: MetastoreServiceClient,
     merge_policy: Arc<dyn MergePolicy>,
+    retention_policy: Option<RetentionPolicy>,
     split_store: IndexingSplitStore,
     split_update_mailbox: SplitsUpdateMailbox,
     max_concurrent_split_uploads: usize,
@@ -173,10 +176,12 @@ pub struct Uploader {
 }
 
 impl Uploader {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         uploader_type: UploaderType,
         metastore: MetastoreServiceClient,
         merge_policy: Arc<dyn MergePolicy>,
+        retention_policy: Option<RetentionPolicy>,
         split_store: IndexingSplitStore,
         split_update_mailbox: SplitsUpdateMailbox,
         max_concurrent_split_uploads: usize,
@@ -186,6 +191,7 @@ impl Uploader {
             uploader_type,
             metastore,
             merge_policy,
+            retention_policy,
             split_store,
             split_update_mailbox,
             max_concurrent_split_uploads,
@@ -299,9 +305,10 @@ impl Handler<PackagedSplitBatch> for Uploader {
         let index_uid = batch.index_uid();
         let ctx_clone = ctx.clone();
         let merge_policy = self.merge_policy.clone();
-        info!(split_ids=?split_ids, "start-stage-and-store-splits");
+        let retention_policy = self.retention_policy.clone();
+        debug!(split_ids=?split_ids, "start-stage-and-store-splits");
         let event_broker = self.event_broker.clone();
-        tokio::spawn(
+        spawn_named_task(
             async move {
                 fail_point!("uploader:intask:before");
 
@@ -323,6 +330,7 @@ impl Handler<PackagedSplitBatch> for Uploader {
                     )?;
                     let split_metadata = create_split_metadata(
                         &merge_policy,
+                        retention_policy.as_ref(),
                         &packaged_split.split_attrs,
                         packaged_split.tags.clone(),
                         split_streamer.footer_range.start..split_streamer.footer_range.end,
@@ -360,7 +368,7 @@ impl Handler<PackagedSplitBatch> for Uploader {
                     if let Err(cause) = upload_result {
                         warn!(cause=?cause, split_id=packaged_split.split_id(), "Failed to upload split. Killing!");
                         kill_switch.kill();
-                        bail!("failed to upload split `{}`. killing the actor contex", packaged_split.split_id());
+                        bail!("failed to upload split `{}`. killing the actor context", packaged_split.split_id());
                     }
 
                     packaged_splits_and_metadata.push((packaged_split, metadata));
@@ -372,7 +380,7 @@ impl Handler<PackagedSplitBatch> for Uploader {
                     batch.checkpoint_delta_opt,
                     batch.publish_lock,
                     batch.publish_token_opt,
-                    batch.merge_operation_opt,
+                    batch.merge_task_opt,
                     batch.batch_parent_span,
                 );
 
@@ -383,6 +391,7 @@ impl Handler<PackagedSplitBatch> for Uploader {
                 Result::<(), anyhow::Error>::Ok(())
             }
             .instrument(Span::current()),
+            "upload_single_task"
         );
         fail_point!("uploader:intask:after");
         Ok(())
@@ -414,7 +423,7 @@ impl Handler<EmptySplit> for Uploader {
             checkpoint_delta_opt: Some(empty_split.checkpoint_delta),
             publish_lock: empty_split.publish_lock,
             publish_token_opt: empty_split.publish_token_opt,
-            merge_operation: None,
+            merge_task: None,
             parent_span: empty_split.batch_parent_span,
         };
 
@@ -429,7 +438,7 @@ fn make_publish_operation(
     checkpoint_delta_opt: Option<IndexCheckpointDelta>,
     publish_lock: PublishLock,
     publish_token_opt: Option<PublishToken>,
-    merge_operation: Option<TrackedObject<MergeOperation>>,
+    merge_task: Option<MergeTask>,
     parent_span: Span,
 ) -> SplitsUpdate {
     assert!(!packaged_splits_and_metadatas.is_empty());
@@ -447,7 +456,7 @@ fn make_publish_operation(
         checkpoint_delta_opt,
         publish_lock,
         publish_token_opt,
-        merge_operation,
+        merge_task,
         parent_span,
     }
 }
@@ -490,9 +499,8 @@ mod tests {
     use quickwit_common::pubsub::EventSubscriber;
     use quickwit_common::temp_dir::TempDirectory;
     use quickwit_metastore::checkpoint::{IndexCheckpointDelta, SourceCheckpointDelta};
-    use quickwit_proto::indexing::IndexingPipelineId;
-    use quickwit_proto::metastore::EmptyResponse;
-    use quickwit_proto::types::PipelineUid;
+    use quickwit_proto::metastore::{EmptyResponse, MockMetastoreService};
+    use quickwit_proto::types::{DocMappingUid, NodeId};
     use quickwit_storage::RamStorage;
     use tantivy::DateTime;
     use tokio::sync::oneshot;
@@ -504,24 +512,23 @@ mod tests {
     #[tokio::test]
     async fn test_uploader_with_sequencer() -> anyhow::Result<()> {
         quickwit_common::setup_logging_for_tests();
+
+        let node_id = NodeId::from("test-node");
+        let index_uid = IndexUid::new_with_random_ulid("test-index");
+        let source_id = "test-source".to_string();
+
         let event_broker = EventBroker::default();
         let universe = Universe::new();
-        let pipeline_id = IndexingPipelineId {
-            index_uid: IndexUid::new_with_random_ulid("test-index"),
-            source_id: "test-source".to_string(),
-            node_id: "test-node".to_string(),
-            pipeline_uid: PipelineUid::default(),
-        };
         let (sequencer_mailbox, sequencer_inbox) =
             universe.create_test_mailbox::<Sequencer<Publisher>>();
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         mock_metastore
             .expect_stage_splits()
             .withf(move |stage_splits_request| -> bool {
                 let splits_metadata = stage_splits_request.deserialize_splits_metadata().unwrap();
                 let split_metadata = &splits_metadata[0];
-                let index_uid: IndexUid = stage_splits_request.index_uid.clone().into();
-                index_uid.index_id() == "test-index"
+                let index_uid: IndexUid = stage_splits_request.index_uid().clone();
+                index_uid.index_id == "test-index"
                     && split_metadata.split_id() == "test-split"
                     && split_metadata.time_range == Some(1628203589..=1628203640)
             })
@@ -533,8 +540,9 @@ mod tests {
         let merge_policy = Arc::new(NopMergePolicy);
         let uploader = Uploader::new(
             UploaderType::IndexUploader,
-            MetastoreServiceClient::from(mock_metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             merge_policy,
+            None,
             split_store,
             SplitsUpdateMailbox::Sequencer(sequencer_mailbox),
             4,
@@ -550,8 +558,11 @@ mod tests {
             .send_message(PackagedSplitBatch::new(
                 vec![PackagedSplit {
                     split_attrs: SplitAttrs {
+                        node_id,
+                        index_uid,
+                        source_id,
+                        doc_mapping_uid: DocMappingUid::default(),
                         partition_id: 3u64,
-                        pipeline_id,
                         time_range: Some(
                             DateTime::from_timestamp_secs(1_628_203_589)
                                 ..=DateTime::from_timestamp_secs(1_628_203_640),
@@ -586,8 +597,8 @@ mod tests {
 
         let publisher_message = match publish_futures.pop().unwrap().await? {
             SequencerCommand::Discard => panic!(
-                "Expected `SequencerCommand::Proceed(SplitUpdate)`, got \
-                 `SequencerCommand::Discard`."
+                "expected `SequencerCommand::Proceed(SplitUpdate)`, got \
+                 `SequencerCommand::Discard`"
             ),
             SequencerCommand::Proceed(publisher_message) => publisher_message,
         };
@@ -599,7 +610,7 @@ mod tests {
             ..
         } = publisher_message;
 
-        assert_eq!(index_uid.index_id(), "test-index");
+        assert_eq!(index_uid.index_id, "test-index");
         assert_eq!(new_splits.len(), 1);
         assert_eq!(new_splits[0].split_id(), "test-split");
         let checkpoint_delta = checkpoint_delta_opt.unwrap();
@@ -618,16 +629,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_uploader_with_sequencer_emits_replace() -> anyhow::Result<()> {
-        let pipeline_id = IndexingPipelineId {
-            index_uid: IndexUid::new_with_random_ulid("test-index"),
-            source_id: "test-source".to_string(),
-            node_id: "test-node".to_string(),
-            pipeline_uid: PipelineUid::default(),
-        };
+        let node_id = NodeId::from("test-node");
+        let index_uid = IndexUid::new_with_random_ulid("test-index");
+        let source_id = "test-source".to_string();
+
         let universe = Universe::new();
         let (sequencer_mailbox, sequencer_inbox) =
             universe.create_test_mailbox::<Sequencer<Publisher>>();
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         mock_metastore
             .expect_stage_splits()
             .withf(move |stage_splits_request| -> bool {
@@ -636,8 +645,8 @@ mod tests {
                     ["test-split-1", "test-split-2"].contains(&metadata.split_id())
                         && metadata.time_range == Some(1628203589..=1628203640)
                 });
-                let index_uid: IndexUid = stage_splits_request.index_uid.clone().into();
-                index_uid.index_id() == "test-index" && is_metadata_valid
+                let index_uid: IndexUid = stage_splits_request.index_uid().clone();
+                index_uid.index_id == "test-index" && is_metadata_valid
             })
             .times(1)
             .returning(|_| Ok(EmptyResponse {}));
@@ -647,8 +656,9 @@ mod tests {
         let merge_policy = Arc::new(NopMergePolicy);
         let uploader = Uploader::new(
             UploaderType::IndexUploader,
-            MetastoreServiceClient::from(mock_metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             merge_policy,
+            None,
             split_store,
             SplitsUpdateMailbox::Sequencer(sequencer_mailbox),
             4,
@@ -659,9 +669,12 @@ mod tests {
         let split_scratch_directory_2 = TempDirectory::for_test();
         let packaged_split_1 = PackagedSplit {
             split_attrs: SplitAttrs {
+                node_id: node_id.clone(),
+                index_uid: index_uid.clone(),
+                source_id: source_id.clone(),
+                doc_mapping_uid: DocMappingUid::default(),
                 split_id: "test-split-1".to_string(),
                 partition_id: 3u64,
-                pipeline_id: pipeline_id.clone(),
                 num_docs: 10,
                 uncompressed_docs_size_in_bytes: 1_000,
                 time_range: Some(
@@ -683,9 +696,12 @@ mod tests {
         };
         let package_split_2 = PackagedSplit {
             split_attrs: SplitAttrs {
+                node_id,
+                index_uid,
+                source_id,
+                doc_mapping_uid: DocMappingUid::default(),
                 split_id: "test-split-2".to_string(),
                 partition_id: 3u64,
-                pipeline_id,
                 num_docs: 10,
                 uncompressed_docs_size_in_bytes: 1_000,
                 time_range: Some(
@@ -737,7 +753,7 @@ mod tests {
             checkpoint_delta_opt,
             ..
         } = publisher_message;
-        assert_eq!(index_uid.index_id(), "test-index");
+        assert_eq!(index_uid.index_id, "test-index");
         // Sort first to avoid test failing.
         replaced_split_ids.sort();
         assert_eq!(new_splits.len(), 2);
@@ -767,20 +783,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_uploader_without_sequencer() -> anyhow::Result<()> {
-        let pipeline_id = IndexingPipelineId {
-            index_uid: IndexUid::from("test-index-no-sequencer:11111111111111111111111111"),
-            source_id: "test-source".to_string(),
-            node_id: "test-node".to_string(),
-            pipeline_uid: PipelineUid::default(),
-        };
+        let node_id = NodeId::from("test-node");
+        let index_uid = IndexUid::for_test("test-index", 0);
+        let index_uid_clone = index_uid.clone();
+        let source_id = "test-source".to_string();
+
         let universe = Universe::new();
         let (publisher_mailbox, publisher_inbox) = universe.create_test_mailbox::<Publisher>();
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         mock_metastore
             .expect_stage_splits()
             .withf(move |stage_splits_request| -> bool {
-                stage_splits_request.index_uid
-                    == "test-index-no-sequencer:11111111111111111111111111"
+                stage_splits_request.index_uid() == &index_uid_clone
             })
             .times(1)
             .returning(|_| Ok(EmptyResponse {}));
@@ -790,8 +804,9 @@ mod tests {
         let merge_policy = Arc::new(NopMergePolicy);
         let uploader = Uploader::new(
             UploaderType::IndexUploader,
-            MetastoreServiceClient::from(mock_metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             merge_policy,
+            None,
             split_store,
             SplitsUpdateMailbox::Publisher(publisher_mailbox),
             4,
@@ -807,13 +822,16 @@ mod tests {
             .send_message(PackagedSplitBatch::new(
                 vec![PackagedSplit {
                     split_attrs: SplitAttrs {
+                        node_id,
+                        index_uid,
+                        source_id,
+                        doc_mapping_uid: DocMappingUid::default(),
+                        split_id: "test-split".to_string(),
                         partition_id: 3u64,
-                        pipeline_id,
                         time_range: None,
                         uncompressed_docs_size_in_bytes: 1_000,
                         num_docs: 10,
                         replaced_split_ids: Vec::new(),
-                        split_id: "test-split".to_string(),
                         delete_opstamp: 10,
                         num_merge_ops: 0,
                     },
@@ -841,7 +859,7 @@ mod tests {
             ..
         } = publisher_inbox.recv_typed_message().await.unwrap();
 
-        assert_eq!(index_uid.index_id(), "test-index-no-sequencer");
+        assert_eq!(index_uid.index_id, "test-index");
         assert_eq!(new_splits.len(), 1);
         assert!(replaced_split_ids.is_empty());
         universe.assert_quit().await;
@@ -853,15 +871,16 @@ mod tests {
         let universe = Universe::new();
         let (sequencer_mailbox, sequencer_inbox) =
             universe.create_test_mailbox::<Sequencer<Publisher>>();
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         mock_metastore.expect_stage_splits().never();
         let ram_storage = RamStorage::default();
         let split_store =
             IndexingSplitStore::create_without_local_store_for_test(Arc::new(ram_storage.clone()));
         let uploader = Uploader::new(
             UploaderType::IndexUploader,
-            MetastoreServiceClient::from(mock_metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             default_merge_policy(),
+            None,
             split_store,
             SplitsUpdateMailbox::Sequencer(sequencer_mailbox),
             4,
@@ -904,7 +923,7 @@ mod tests {
             ..
         } = publisher_message;
 
-        assert_eq!(index_uid.index_id(), "test-index");
+        assert_eq!(index_uid.index_id, "test-index");
         assert_eq!(new_splits.len(), 0);
         let checkpoint_delta = checkpoint_delta_opt.unwrap();
         assert_eq!(checkpoint_delta.source_id, "test-source");
@@ -947,14 +966,12 @@ mod tests {
         // we need to keep the handle alive.
         let _subscribe_handle = event_broker.subscribe(report_splits_listener);
 
+        let node_id = NodeId::from("test-node");
+        let index_uid = IndexUid::new_with_random_ulid("test-index");
+        let source_id = "test-source".to_string();
+
         let universe = Universe::new();
-        let pipeline_id = IndexingPipelineId {
-            index_uid: IndexUid::new_with_random_ulid("test-index"),
-            source_id: "test-source".to_string(),
-            node_id: "test-node".to_string(),
-            pipeline_uid: PipelineUid::default(),
-        };
-        let mut mock_metastore = MetastoreServiceClient::mock();
+        let mut mock_metastore = MockMetastoreService::new();
         mock_metastore
             .expect_stage_splits()
             .times(1)
@@ -966,8 +983,9 @@ mod tests {
         let (publisher_mailbox, _publisher_inbox) = universe.create_test_mailbox();
         let uploader = Uploader::new(
             UploaderType::IndexUploader,
-            MetastoreServiceClient::from(mock_metastore),
+            MetastoreServiceClient::from_mock(mock_metastore),
             merge_policy,
+            None,
             split_store,
             SplitsUpdateMailbox::Publisher(publisher_mailbox),
             4,
@@ -983,8 +1001,11 @@ mod tests {
             .send_message(PackagedSplitBatch::new(
                 vec![PackagedSplit {
                     split_attrs: SplitAttrs {
+                        node_id,
+                        index_uid,
+                        source_id,
+                        doc_mapping_uid: DocMappingUid::default(),
                         partition_id: 3u64,
-                        pipeline_id,
                         time_range: Some(
                             DateTime::from_timestamp_secs(1_628_203_589)
                                 ..=DateTime::from_timestamp_secs(1_628_203_640),

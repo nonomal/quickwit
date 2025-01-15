@@ -106,10 +106,10 @@ impl<T> SortedIterator for T where T: Iterator + Sorted {}
 
 impl<K, V> Sorted for btree_map::IntoKeys<K, V> {}
 impl<K, V> Sorted for btree_map::IntoValues<K, V> {}
-impl<'a, K, V> Sorted for btree_map::Keys<'a, K, V> {}
-impl<'a, K, V> Sorted for btree_map::Values<'a, K, V> {}
+impl<K, V> Sorted for btree_map::Keys<'_, K, V> {}
+impl<K, V> Sorted for btree_map::Values<'_, K, V> {}
 impl<K> Sorted for btree_set::IntoIter<K> {}
-impl<'a, K> Sorted for btree_set::Iter<'a, K> {}
+impl<K> Sorted for btree_set::Iter<'_, K> {}
 
 /// Same as [`SortedIterator`] but for (key, value) pairs sorted by key.
 pub trait SortedByKeyIterator<K, V>: Iterator + Sized {
@@ -194,7 +194,7 @@ where
 impl<T, K, V> SortedByKeyIterator<K, V> for T where T: Iterator<Item = (K, V)> + Sorted {}
 
 impl<K, V> Sorted for btree_map::IntoIter<K, V> {}
-impl<'a, K, V> Sorted for btree_map::Iter<'a, K, V> {}
+impl<K, V> Sorted for btree_map::Iter<'_, K, V> {}
 
 #[cfg(test)]
 mod tests {
@@ -205,19 +205,19 @@ mod tests {
     #[test]
     fn test_diff() {
         {
-            let left: BTreeSet<u64> = vec![].into_iter().collect();
-            let right: BTreeSet<u64> = vec![].into_iter().collect();
+            let left: BTreeSet<u64> = Vec::new().into_iter().collect();
+            let right: BTreeSet<u64> = Vec::new().into_iter().collect();
             let diff: Vec<_> = left.iter().diff(right.iter()).collect();
-            assert_eq!(diff, vec![]);
+            assert_eq!(diff, Vec::new());
         }
         {
             let left: BTreeSet<_> = vec![1].into_iter().collect();
-            let right: BTreeSet<_> = vec![].into_iter().collect();
+            let right: BTreeSet<_> = Vec::new().into_iter().collect();
             let diff: Vec<_> = left.iter().diff(right.iter()).collect();
             assert_eq!(diff, vec![Diff::Removed(&1)]);
         }
         {
-            let left: BTreeSet<_> = vec![].into_iter().collect();
+            let left: BTreeSet<_> = Vec::new().into_iter().collect();
             let right: BTreeSet<_> = vec![1].into_iter().collect();
             let diff: Vec<_> = left.iter().diff(right.iter()).collect();
             assert_eq!(diff, vec![Diff::Added(&1)]);
@@ -250,19 +250,19 @@ mod tests {
     #[test]
     fn test_diff_by_key() {
         {
-            let left: BTreeMap<u64, u64> = vec![].into_iter().collect();
-            let right: BTreeMap<u64, u64> = vec![].into_iter().collect();
+            let left: BTreeMap<u64, u64> = Vec::new().into_iter().collect();
+            let right: BTreeMap<u64, u64> = Vec::new().into_iter().collect();
             let key_diff: Vec<_> = left.iter().diff_by_key(right.iter()).collect();
-            assert_eq!(key_diff, vec![]);
+            assert_eq!(key_diff, Vec::new());
         }
         {
             let left: BTreeMap<_, _> = vec![(1, 1)].into_iter().collect();
-            let right: BTreeMap<_, &'static str> = vec![].into_iter().collect();
+            let right: BTreeMap<_, &'static str> = Vec::new().into_iter().collect();
             let key_diff: Vec<_> = left.iter().diff_by_key(right.iter()).collect();
             assert_eq!(key_diff, vec![KeyDiff::Removed(&1, &1)]);
         }
         {
-            let left: BTreeMap<_, usize> = vec![].into_iter().collect();
+            let left: BTreeMap<_, usize> = Vec::new().into_iter().collect();
             let right: BTreeMap<_, _> = vec![(1, "a")].into_iter().collect();
             let key_diff: Vec<_> = left.iter().diff_by_key(right.iter()).collect();
             assert_eq!(key_diff, vec![KeyDiff::Added(&1, &"a")]);

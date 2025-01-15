@@ -62,7 +62,6 @@ json:
           - name: login
             type: text
             fast: true
-
 ---
 # Ingest documents in index 1
 method: POST

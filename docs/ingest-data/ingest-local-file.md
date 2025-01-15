@@ -33,7 +33,7 @@ index_id: stackoverflow-schemaless
 doc_mapping:
   mode: dynamic
 indexing_settings:
-  commit_timeout_secs: 1
+  commit_timeout_secs: 30
 EOF
 
 ./quickwit index create --index-config stackoverflow-schemaless-config.yaml
@@ -71,6 +71,12 @@ Clearing local cache directory...
 ✔ Local cache directory cleared.
 ✔ Documents successfully indexed.
 ```
+
+:::tip
+
+Object store URIs like `s3://mybucket/mykey.json` are also supported as `--input-path`, provided that your environment is configured with the appropriate permissions.
+
+:::
 
 ## Tear down resources (optional)
 

@@ -18,7 +18,9 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use once_cell::sync::Lazy;
-use quickwit_common::metrics::{new_counter_vec, new_histogram_vec, HistogramVec, IntCounterVec};
+use quickwit_common::metrics::{
+    exponential_buckets, new_counter_vec, new_histogram_vec, HistogramVec, IntCounterVec,
+};
 
 pub struct JaegerServiceMetrics {
     pub requests_total: IntCounterVec<2>,
@@ -35,37 +37,44 @@ impl Default for JaegerServiceMetrics {
             requests_total: new_counter_vec(
                 "requests_total",
                 "Number of requests",
-                "quickwit_jaeger",
+                "jaeger",
+                &[],
                 ["operation", "index"],
             ),
             request_errors_total: new_counter_vec(
                 "request_errors_total",
                 "Number of failed requests",
-                "quickwit_jaeger",
+                "jaeger",
+                &[],
                 ["operation", "index"],
             ),
             request_duration_seconds: new_histogram_vec(
                 "request_duration_seconds",
                 "Duration of requests",
-                "quickwit_jaeger",
+                "jaeger",
+                &[],
                 ["operation", "index", "error"],
+                exponential_buckets(0.02, 2.0, 8).unwrap(),
             ),
             fetched_traces_total: new_counter_vec(
                 "fetched_traces_total",
                 "Number of traces retrieved from storage",
-                "quickwit_jaeger",
+                "jaeger",
+                &[],
                 ["operation", "index"],
             ),
             fetched_spans_total: new_counter_vec(
                 "fetched_spans_total",
                 "Number of spans retrieved from storage",
-                "quickwit_jaeger",
+                "jaeger",
+                &[],
                 ["operation", "index"],
             ),
             transferred_bytes_total: new_counter_vec(
                 "transferred_bytes_total",
                 "Number of bytes transferred",
-                "quickwit_jaeger",
+                "jaeger",
+                &[],
                 ["operation", "index"],
             ),
         }

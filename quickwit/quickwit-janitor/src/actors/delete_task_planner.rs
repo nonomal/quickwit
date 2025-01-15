@@ -28,7 +28,7 @@ use quickwit_actors::{Actor, ActorContext, ActorExitStatus, Handler, Mailbox, Qu
 use quickwit_common::extract_time_range;
 use quickwit_common::uri::Uri;
 use quickwit_doc_mapper::tag_pruning::extract_tags_from_query;
-use quickwit_indexing::actors::MergeSplitDownloader;
+use quickwit_indexing::actors::{schedule_merge, MergeSchedulerService, MergeSplitDownloader};
 use quickwit_indexing::merge_policy::MergeOperation;
 use quickwit_metastore::{split_tag_filter, split_time_range_filter, ListSplitsResponseExt, Split};
 use quickwit_proto::metastore::{
@@ -37,7 +37,7 @@ use quickwit_proto::metastore::{
 };
 use quickwit_proto::search::SearchRequest;
 use quickwit_proto::types::IndexUid;
-use quickwit_search::{jobs_to_leaf_requests, IndexMetasForLeafSearch, SearchJob, SearchJobPlacer};
+use quickwit_search::{jobs_to_leaf_request, IndexMetasForLeafSearch, SearchJob, SearchJobPlacer};
 use serde::Serialize;
 use tantivy::Inventory;
 use tracing::{debug, info};
@@ -83,6 +83,7 @@ pub struct DeleteTaskPlanner {
     metastore: MetastoreServiceClient,
     search_job_placer: SearchJobPlacer,
     merge_split_downloader_mailbox: Mailbox<MergeSplitDownloader>,
+    merge_scheduler_service: Mailbox<MergeSchedulerService>,
     /// Inventory of ongoing delete operations. If everything goes well,
     /// a merge operation is dropped after the publish of the split that underwent
     /// the delete operation.
@@ -127,6 +128,7 @@ impl DeleteTaskPlanner {
         metastore: MetastoreServiceClient,
         search_job_placer: SearchJobPlacer,
         merge_split_downloader_mailbox: Mailbox<MergeSplitDownloader>,
+        merge_scheduler_service: Mailbox<MergeSchedulerService>,
     ) -> Self {
         Self {
             index_uid,
@@ -135,6 +137,7 @@ impl DeleteTaskPlanner {
             metastore,
             search_job_placer,
             merge_split_downloader_mailbox,
+            merge_scheduler_service,
             ongoing_delete_operations_inventory: Inventory::new(),
         }
     }
@@ -144,7 +147,7 @@ impl DeleteTaskPlanner {
         // Loop until there is no more stale splits.
         loop {
             let last_delete_opstamp_request = LastDeleteOpstampRequest {
-                index_uid: self.index_uid.to_string(),
+                index_uid: Some(self.index_uid.clone()),
             };
             let last_delete_opstamp = self
                 .metastore
@@ -156,7 +159,7 @@ impl DeleteTaskPlanner {
                 .await?;
             ctx.record_progress();
             debug!(
-                index_id = self.index_uid.index_id(),
+                index_id = self.index_uid.index_id,
                 last_delete_opstamp = last_delete_opstamp,
                 num_stale_splits = stale_splits.len()
             );
@@ -181,7 +184,7 @@ impl DeleteTaskPlanner {
                 .map(|split| split.split_id().to_string())
                 .collect_vec();
             let update_splits_delete_opstamp_request = UpdateSplitsDeleteOpstampRequest {
-                index_uid: self.index_uid.to_string(),
+                index_uid: Some(self.index_uid.clone()),
                 split_ids: split_ids_without_delete.clone(),
                 delete_opstamp: last_delete_opstamp,
             };
@@ -200,14 +203,17 @@ impl DeleteTaskPlanner {
                 let tracked_delete_operation = self
                     .ongoing_delete_operations_inventory
                     .track(delete_operation);
-                ctx.send_message(
-                    &self.merge_split_downloader_mailbox,
+                schedule_merge(
+                    &self.merge_scheduler_service,
                     tracked_delete_operation,
+                    self.merge_split_downloader_mailbox.clone(),
                 )
                 .await?;
+                let index_label =
+                    quickwit_common::metrics::index_label(self.index_uid.index_id.as_str());
                 JANITOR_METRICS
                     .ongoing_num_delete_operations_total
-                    .with_label_values([self.index_uid.index_id()])
+                    .with_label_values([index_label])
                     .set(self.ongoing_delete_operations_inventory.list().len() as i64);
             }
         }
@@ -306,9 +312,7 @@ impl DeleteTaskPlanner {
                 .expect("Delete task must have a delete query.");
             // TODO: resolve with the default fields.
             let search_request = SearchRequest {
-                index_id_patterns: vec![IndexUid::from(delete_query.index_uid.clone())
-                    .index_id()
-                    .to_string()],
+                index_id_patterns: vec![delete_query.index_uid().index_id.to_string()],
                 query_ast: delete_query.query_ast.clone(),
                 start_timestamp: delete_query.start_timestamp,
                 end_timestamp: delete_query.end_timestamp,
@@ -317,30 +321,28 @@ impl DeleteTaskPlanner {
             let mut search_indexes_metas = HashMap::new();
             let index_uri = Uri::from_str(index_uri).context("invalid index URI")?;
             search_indexes_metas.insert(
-                IndexUid::from(delete_query.index_uid.clone()),
+                delete_query.index_uid().clone(),
                 IndexMetasForLeafSearch {
                     doc_mapper_str: doc_mapper_str.to_string(),
                     index_uri,
                 },
             );
-            let leaf_search_request = jobs_to_leaf_requests(
+            let leaf_search_request = jobs_to_leaf_request(
                 &search_request,
                 &search_indexes_metas,
                 vec![search_job.clone()],
             )?;
-            for leaf_request in leaf_search_request {
-                let response = search_client.leaf_search(leaf_request).await?;
-                ctx.record_progress();
-                if response.num_hits > 0 {
-                    return Ok(true);
-                }
+            let response = search_client.leaf_search(leaf_search_request).await?;
+            ctx.record_progress();
+            if response.num_hits > 0 {
+                return Ok(true);
             }
         }
         Ok(false)
     }
 
-    /// Fetches stale splits from [`Metastore`] and excludes immature splits and split already among
-    /// ongoing delete operations.
+    /// Fetches stale splits from [`quickwit_metastore::Metastore`] and excludes immature splits and
+    /// split already among ongoing delete operations.
     async fn get_relevant_stale_splits(
         &mut self,
         index_uid: IndexUid,
@@ -348,16 +350,17 @@ impl DeleteTaskPlanner {
         ctx: &ActorContext<Self>,
     ) -> MetastoreResult<Vec<Split>> {
         let list_stale_splits_request = ListStaleSplitsRequest {
-            index_uid: index_uid.to_string(),
+            index_uid: Some(index_uid.clone()),
             delete_opstamp: last_delete_opstamp,
             num_splits: NUM_STALE_SPLITS_TO_FETCH as u64,
         };
         let stale_splits = ctx
             .protect_future(self.metastore.list_stale_splits(list_stale_splits_request))
             .await?
-            .deserialize_splits()?;
+            .deserialize_splits()
+            .await?;
         debug!(
-            index_id = index_uid.index_id(),
+            index_id = index_uid.index_id,
             last_delete_opstamp = last_delete_opstamp,
             num_stale_splits_from_metastore = stale_splits.len()
         );
@@ -414,8 +417,7 @@ impl Handler<PlanDeleteLoop> for DeleteTaskPlanner {
         ctx: &ActorContext<Self>,
     ) -> Result<(), ActorExitStatus> {
         self.handle(PlanDeleteOperations, ctx).await?;
-        ctx.schedule_self_msg(PLANNER_REFRESH_INTERVAL, PlanDeleteLoop)
-            .await;
+        ctx.schedule_self_msg(PLANNER_REFRESH_INTERVAL, PlanDeleteLoop);
         Ok(())
     }
 }
@@ -423,7 +425,7 @@ impl Handler<PlanDeleteLoop> for DeleteTaskPlanner {
 #[cfg(test)]
 mod tests {
     use quickwit_config::build_doc_mapper;
-    use quickwit_indexing::merge_policy::MergeOperation;
+    use quickwit_indexing::merge_policy::MergeTask;
     use quickwit_indexing::TestSandbox;
     use quickwit_metastore::{
         IndexMetadataResponseExt, ListSplitsRequestExt, MetastoreServiceStreamSplitsExt,
@@ -432,7 +434,6 @@ mod tests {
     use quickwit_proto::metastore::{DeleteQuery, IndexMetadataRequest, ListSplitsRequest};
     use quickwit_proto::search::{LeafSearchRequest, LeafSearchResponse};
     use quickwit_search::{searcher_pool_for_test, MockSearchService};
-    use tantivy::TrackedObject;
 
     use super::*;
 
@@ -459,6 +460,7 @@ mod tests {
             &["body"],
         )
         .await?;
+        let universe = test_sandbox.universe();
         let docs = [
             serde_json::json!({"body": "info", "ts": 0 }),
             serde_json::json!({"body": "info", "ts": 0 }),
@@ -468,7 +470,7 @@ mod tests {
         for doc in docs {
             test_sandbox.add_documents(vec![doc]).await?;
         }
-        let mut metastore = test_sandbox.metastore();
+        let metastore = test_sandbox.metastore();
         let index_metadata_request = IndexMetadataRequest::for_index_id(index_id.to_string());
         let index_metadata = metastore
             .index_metadata(index_metadata_request)
@@ -498,7 +500,7 @@ mod tests {
             quickwit_query::query_ast::qast_json_helper("body:matchnothing", &[]);
         metastore
             .create_delete_task(DeleteQuery {
-                index_uid: index_uid.to_string(),
+                index_uid: Some(index_uid.clone()),
                 start_timestamp: None,
                 end_timestamp: None,
                 query_ast: body_delete_ast.clone(),
@@ -506,7 +508,7 @@ mod tests {
             .await?;
         metastore
             .create_delete_task(DeleteQuery {
-                index_uid: index_uid.to_string(),
+                index_uid: Some(index_uid.clone()),
                 start_timestamp: None,
                 end_timestamp: None,
                 query_ast: match_nothing_ast,
@@ -521,7 +523,7 @@ mod tests {
             move |request: LeafSearchRequest| {
                 // Search on body:delete should return one hit only on the last split
                 // that should contains the doc.
-                if request.split_offsets[0].split_id == split_id_with_doc_to_delete
+                if request.leaf_requests[0].split_offsets[0].split_id == split_id_with_doc_to_delete
                     && request.search_request.as_ref().unwrap().query_ast == body_delete_ast
                 {
                     return Ok(LeafSearchResponse {
@@ -537,22 +539,24 @@ mod tests {
         );
         let searcher_pool = searcher_pool_for_test([("127.0.0.1:1000", mock_search_service)]);
         let search_job_placer = SearchJobPlacer::new(searcher_pool);
-        let (downloader_mailbox, downloader_inbox) = test_sandbox.universe().create_test_mailbox();
-        let delete_planner_executor = DeleteTaskPlanner::new(
+        let merge_scheduler_mailbox = universe.get_or_spawn_one();
+        let (merge_split_downloader_mailbox, merge_split_downloader_inbox) =
+            universe.create_test_mailbox();
+        let delete_planner = DeleteTaskPlanner::new(
             index_uid.clone(),
             index_config.index_uri.clone(),
             doc_mapper_str,
             metastore.clone(),
             search_job_placer,
-            downloader_mailbox,
+            merge_split_downloader_mailbox,
+            merge_scheduler_mailbox,
         );
         let (delete_planner_mailbox, delete_planner_handle) = test_sandbox
             .universe()
             .spawn_builder()
-            .spawn(delete_planner_executor);
+            .spawn(delete_planner);
         delete_planner_handle.process_pending_and_observe().await;
-        let downloader_msgs: Vec<TrackedObject<MergeOperation>> =
-            downloader_inbox.drain_for_test_typed();
+        let downloader_msgs: Vec<MergeTask> = merge_split_downloader_inbox.drain_for_test_typed();
         assert_eq!(downloader_msgs.len(), 1);
         // The last split will undergo a delete operation.
         assert_eq!(
@@ -570,7 +574,7 @@ mod tests {
             .ask(PlanDeleteOperations)
             .await
             .unwrap();
-        assert!(downloader_inbox.drain_for_test().is_empty());
+        assert!(merge_split_downloader_inbox.drain_for_test().is_empty());
         // Now drop the current merge operation and check that the planner will plan a new
         // operation.
         drop(downloader_msgs.into_iter().next().unwrap());
@@ -586,8 +590,7 @@ mod tests {
             .ask(PlanDeleteOperations)
             .await
             .unwrap();
-        let downloader_last_msgs =
-            downloader_inbox.drain_for_test_typed::<TrackedObject<MergeOperation>>();
+        let downloader_last_msgs = merge_split_downloader_inbox.drain_for_test_typed::<MergeTask>();
         assert_eq!(downloader_last_msgs.len(), 1);
         assert_eq!(
             downloader_last_msgs[0].splits[0].split_id(),

@@ -8,7 +8,7 @@ RUN touch .gitignore_for_build_directory \
     && NODE_ENV=production make install build
 
 
-FROM rust:bullseye AS bin-builder
+FROM rust:bookworm AS bin-builder
 
 ARG CARGO_FEATURES=release-feature-set
 ARG CARGO_PROFILE=release
@@ -39,15 +39,18 @@ COPY --from=ui-builder /quickwit/quickwit-ui/build /quickwit/quickwit-ui/build
 WORKDIR /quickwit
 
 RUN echo "Building workspace with feature(s) '$CARGO_FEATURES' and profile '$CARGO_PROFILE'" \
-    && cargo build \
+    && RUSTFLAGS="--cfg tokio_unstable" \
+        cargo build \
+        -p quickwit-cli \
         --features $CARGO_FEATURES \
+        --bin quickwit \
         $(test "$CARGO_PROFILE" = "release" && echo "--release") \
     && echo "Copying binaries to /quickwit/bin" \
     && mkdir -p /quickwit/bin \
     && find target/$CARGO_PROFILE -maxdepth 1 -perm /a+x -type f -exec mv {} /quickwit/bin \;
 
 
-FROM debian:bullseye-slim AS quickwit
+FROM debian:bookworm-slim AS quickwit
 
 LABEL org.opencontainers.image.title="Quickwit"
 LABEL maintainer="Quickwit, Inc. <hello@quickwit.io>"
@@ -56,7 +59,7 @@ LABEL org.opencontainers.image.licenses="AGPL-3.0"
 
 RUN apt-get -y update \
     && apt-get -y install ca-certificates \
-                          libssl1.1 \
+                          libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /quickwit

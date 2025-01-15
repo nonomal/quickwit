@@ -18,6 +18,7 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use std::env;
+use std::sync::Arc;
 
 use anyhow::Context;
 use opentelemetry::sdk::propagation::TraceContextPropagator;
@@ -25,7 +26,8 @@ use opentelemetry::sdk::trace::BatchConfig;
 use opentelemetry::sdk::{trace, Resource};
 use opentelemetry::{global, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
-use quickwit_serve::BuildInfo;
+use quickwit_common::get_bool_from_env;
+use quickwit_serve::{BuildInfo, EnvFilterReloadFn};
 use tracing::Level;
 use tracing_subscriber::fmt::time::UtcTime;
 use tracing_subscriber::prelude::*;
@@ -39,20 +41,21 @@ pub fn setup_logging_and_tracing(
     level: Level,
     ansi_colors: bool,
     build_info: &BuildInfo,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<EnvFilterReloadFn> {
     #[cfg(feature = "tokio-console")]
     {
-        if std::env::var_os(QW_ENABLE_TOKIO_CONSOLE_ENV_KEY).is_some() {
+        if get_bool_from_env(QW_ENABLE_TOKIO_CONSOLE_ENV_KEY, false) {
             console_subscriber::init();
-            return Ok(());
+            return Ok(quickwit_serve::do_nothing_env_filter_reload_fn());
         }
     }
     let env_filter = env::var("RUST_LOG")
         .map(|_| EnvFilter::from_default_env())
         .or_else(|_| EnvFilter::try_new(format!("quickwit={level},tantivy=WARN")))
-        .context("Failed to set up tracing env filter.")?;
+        .context("failed to set up tracing env filter")?;
     global::set_text_map_propagator(TraceContextPropagator::new());
-    let registry = tracing_subscriber::registry().with(env_filter);
+    let (reloadable_env_filter, reload_handle) = tracing_subscriber::reload::Layer::new(env_filter);
+    let registry = tracing_subscriber::registry().with(reloadable_env_filter);
     let event_format = tracing_subscriber::fmt::format()
         .with_target(true)
         .with_timer(
@@ -67,7 +70,7 @@ pub fn setup_logging_and_tracing(
         );
     // Note on disabling ANSI characters: setting the ansi boolean on event format is insufficient.
     // It is thus set on layers, see https://github.com/tokio-rs/tracing/issues/1817
-    if std::env::var_os(QW_ENABLE_OPENTELEMETRY_OTLP_EXPORTER_ENV_KEY).is_some() {
+    if get_bool_from_env(QW_ENABLE_OPENTELEMETRY_OTLP_EXPORTER_ENV_KEY, false) {
         let otlp_exporter = opentelemetry_otlp::new_exporter().tonic().with_env();
         // In debug mode, Quickwit can generate a lot of spans, and the default queue size of 2048
         // is too small.
@@ -82,7 +85,7 @@ pub fn setup_logging_and_tracing(
             .with_trace_config(trace_config)
             .with_batch_config(batch_config)
             .install_batch(opentelemetry::runtime::Tokio)
-            .context("Failed to initialize OpenTelemetry OTLP exporter.")?;
+            .context("failed to initialize OpenTelemetry OTLP exporter")?;
         registry
             .with(tracing_opentelemetry::layer().with_tracer(tracer))
             .with(
@@ -91,7 +94,7 @@ pub fn setup_logging_and_tracing(
                     .with_ansi(ansi_colors),
             )
             .try_init()
-            .context("Failed to set up tracing.")?;
+            .context("failed to register tracing subscriber")?;
     } else {
         registry
             .with(
@@ -100,7 +103,11 @@ pub fn setup_logging_and_tracing(
                     .with_ansi(ansi_colors),
             )
             .try_init()
-            .context("Failed to set up tracing.")?;
+            .context("failed to register tracing subscriber")?;
     }
-    Ok(())
+    Ok(Arc::new(move |env_filter_def: &str| {
+        let new_env_filter = EnvFilter::try_new(env_filter_def)?;
+        reload_handle.reload(new_env_filter)?;
+        Ok(())
+    }))
 }

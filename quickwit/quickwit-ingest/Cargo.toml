@@ -1,22 +1,24 @@
 [package]
 name = "quickwit-ingest"
-version = "0.7.0"
-edition = "2021"
-license = "AGPL-3.0-or-later"                               # For a commercial, license, contact hello@quickwit.io
-description = "Quickwit is a cost-efficient search engine."
+description = "Native distributed and replicated ingestion engine"
+
+version.workspace = true
+edition.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+repository.workspace = true
+authors.workspace = true
+license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 bytesize = { workspace = true }
-dyn-clone = { workspace = true }
-fail = { workspace = true }
-flume = { workspace = true }
-fnv = { workspace = true }
+fail = { workspace = true, optional = true }
 futures = { workspace = true }
 http = { workspace = true }
-hyper = { workspace = true }
+itertools = { workspace = true }
 mockall = { workspace = true, optional = true }
 mrecordlog = { workspace = true }
 once_cell = { workspace = true }
@@ -24,18 +26,20 @@ prost = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_json_borrow = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 tower = { workspace = true }
 tracing = { workspace = true }
-ulid = {workspace = true }
+ulid = { workspace = true }
 utoipa = { workspace = true }
 
 quickwit-actors = { workspace = true }
 quickwit-cluster = { workspace = true }
-quickwit-common = { workspace = true }
+quickwit-common = { workspace = true, features = ["testsuite"] }
 quickwit-config = { workspace = true }
+quickwit-doc-mapper = { workspace = true, features = ["testsuite"] }
 quickwit-proto = { workspace = true }
 
 [dev-dependencies]
@@ -44,6 +48,7 @@ mockall = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"]}
 
 quickwit-actors = { workspace = true, features = ["testsuite"] }
 quickwit-cluster = { workspace = true, features = ["testsuite"] }
@@ -54,4 +59,6 @@ quickwit-proto = { workspace = true, features = ["testsuite"] }
 quickwit-codegen = { workspace = true }
 
 [features]
+failpoints = ["fail/failpoints"]
+no-failpoints = []
 testsuite = ["mockall"]

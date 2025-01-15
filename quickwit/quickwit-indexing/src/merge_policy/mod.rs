@@ -22,6 +22,7 @@ mod nop_merge_policy;
 mod stable_log_merge_policy;
 
 use std::fmt;
+use std::ops::Deref;
 use std::sync::Arc;
 
 pub(crate) use const_write_amplification::ConstWriteAmplificationMergePolicy;
@@ -30,10 +31,13 @@ pub use nop_merge_policy::NopMergePolicy;
 use quickwit_config::merge_policy_config::MergePolicyConfig;
 use quickwit_config::IndexingSettings;
 use quickwit_metastore::{SplitMaturity, SplitMetadata};
+use quickwit_proto::types::SplitId;
 use serde::Serialize;
 pub(crate) use stable_log_merge_policy::StableLogMergePolicy;
+use tantivy::TrackedObject;
 use tracing::{info_span, Span};
 
+use crate::actors::MergePermit;
 use crate::new_split_id;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -48,11 +52,42 @@ impl fmt::Display for MergeOperationType {
     }
 }
 
+pub struct MergeTask {
+    pub merge_operation: TrackedObject<MergeOperation>,
+    pub(crate) _merge_permit: MergePermit,
+}
+
+impl MergeTask {
+    #[cfg(any(test, feature = "testsuite"))]
+    pub fn from_merge_operation_for_test(merge_operation: MergeOperation) -> MergeTask {
+        let inventory = tantivy::Inventory::default();
+        let tracked_merge_operation = inventory.track(merge_operation);
+        MergeTask {
+            merge_operation: tracked_merge_operation,
+            _merge_permit: MergePermit::for_test(),
+        }
+    }
+}
+
+impl fmt::Debug for MergeTask {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.merge_operation.as_ref().fmt(f)
+    }
+}
+
+impl Deref for MergeTask {
+    type Target = MergeOperation;
+
+    fn deref(&self) -> &Self::Target {
+        self.merge_operation.as_ref()
+    }
+}
+
 #[derive(Clone, Serialize)]
 pub struct MergeOperation {
     #[serde(skip_serializing)]
     pub merge_parent_span: Span,
-    pub merge_split_id: String,
+    pub merge_split_id: SplitId,
     pub splits: Vec<SplitMetadata>,
     pub operation_type: MergeOperationType,
 }
@@ -68,6 +103,13 @@ impl MergeOperation {
             splits,
             operation_type: MergeOperationType::Merge,
         }
+    }
+
+    pub fn total_num_bytes(&self) -> u64 {
+        self.splits
+            .iter()
+            .map(|split: &SplitMetadata| split.footer_offsets.end)
+            .sum()
     }
 
     pub fn new_delete_and_merge_operation(split: SplitMetadata) -> Self {
@@ -109,6 +151,17 @@ pub trait MergePolicy: Send + Sync + fmt::Debug {
     /// Returns the list of merge operations that should be performed.
     fn operations(&self, splits: &mut Vec<SplitMetadata>) -> Vec<MergeOperation>;
 
+    /// After the last indexing pipeline has been shutdown, quickwit
+    /// finishes the ongoing merge operations, and eventually needs to shut it down.
+    ///
+    /// This method makes it possible to offer a last list of merge operations before
+    /// really shutting down the merge policy.
+    ///
+    /// This is especially useful for users relying on a one-index-per-day scheme.
+    fn finalize_operations(&self, _splits: &mut Vec<SplitMetadata>) -> Vec<MergeOperation> {
+        Vec::new()
+    }
+
     /// Returns split maturity.
     /// A split is either:
     /// - `Mature` if it does not undergo new merge operations.
@@ -125,8 +178,7 @@ pub trait MergePolicy: Send + Sync + fmt::Debug {
 }
 
 pub fn merge_policy_from_settings(settings: &IndexingSettings) -> Arc<dyn MergePolicy> {
-    let merge_policy_config = settings.merge_policy.clone();
-    match merge_policy_config {
+    match settings.merge_policy.clone() {
         MergePolicyConfig::Nop => Arc::new(NopMergePolicy),
         MergePolicyConfig::ConstWriteAmplification(config) => {
             let merge_policy =
@@ -141,12 +193,17 @@ pub fn merge_policy_from_settings(settings: &IndexingSettings) -> Arc<dyn MergeP
 }
 
 pub fn default_merge_policy() -> Arc<dyn MergePolicy> {
-    merge_policy_from_settings(&IndexingSettings::default())
+    let indexing_settings = IndexingSettings::default();
+    merge_policy_from_settings(&indexing_settings)
+}
+
+pub fn nop_merge_policy() -> Arc<dyn MergePolicy> {
+    Arc::new(NopMergePolicy)
 }
 
 struct SplitShortDebug<'a>(&'a SplitMetadata);
 
-impl<'a> fmt::Debug for SplitShortDebug<'a> {
+impl fmt::Debug for SplitShortDebug<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Split")
             .field("split_id", &self.0.split_id())
@@ -169,14 +226,16 @@ pub mod tests {
 
     use proptest::prelude::*;
     use quickwit_actors::Universe;
-    use quickwit_proto::indexing::IndexingPipelineId;
-    use quickwit_proto::types::{IndexUid, PipelineUid};
+    use quickwit_proto::indexing::{IndexingPipelineId, MergePipelineId};
+    use quickwit_proto::types::{IndexUid, NodeId, PipelineUid};
     use rand::seq::SliceRandom;
-    use tantivy::TrackedObject;
     use time::OffsetDateTime;
 
     use super::*;
-    use crate::actors::{merge_split_attrs, MergePlanner, MergeSplitDownloader};
+    use crate::actors::{
+        merge_split_attrs, MergePlanner, MergeSchedulerService, MergeSplitDownloader,
+        RunFinalizeMergePolicyAndQuit,
+    };
     use crate::models::{create_split_metadata, NewSplits};
 
     fn pow_of_10(n: usize) -> usize {
@@ -331,14 +390,13 @@ pub mod tests {
         assert!(!splits.is_empty(), "Split list should not be empty.");
         let merged_split_id = new_split_id();
         let tags = merge_tags(splits);
-        let pipeline_id = IndexingPipelineId {
+        let pipeline_id = MergePipelineId {
+            node_id: NodeId::from("test_node"),
             index_uid: IndexUid::new_with_random_ulid("test_index"),
             source_id: "test_source".to_string(),
-            node_id: "test_node".to_string(),
-            pipeline_uid: PipelineUid::from_u128(0u128),
         };
-        let split_attrs = merge_split_attrs(merged_split_id, &pipeline_id, splits);
-        create_split_metadata(merge_policy, &split_attrs, tags, 0..0)
+        let split_attrs = merge_split_attrs(pipeline_id, merged_split_id, splits).unwrap();
+        create_split_metadata(merge_policy, None, &split_attrs, tags, 0..0)
     }
 
     fn apply_merge(
@@ -354,30 +412,31 @@ pub mod tests {
         merged_split
     }
 
-    pub async fn aux_test_simulate_merge_planner<CheckFn: Fn(&[SplitMetadata])>(
+    async fn aux_test_simulate_merge_planner(
         merge_policy: Arc<dyn MergePolicy>,
         incoming_splits: Vec<SplitMetadata>,
-        check_final_configuration: CheckFn,
+        check_final_configuration: &dyn Fn(&[SplitMetadata]),
     ) -> anyhow::Result<Vec<SplitMetadata>> {
         let universe = Universe::new();
-        let (merge_op_mailbox, merge_op_inbox) =
+        let (merge_task_mailbox, merge_task_inbox) =
             universe.create_test_mailbox::<MergeSplitDownloader>();
         let pipeline_id = IndexingPipelineId {
             index_uid: IndexUid::new_with_random_ulid("test-index"),
             source_id: "test-source".to_string(),
-            node_id: "test-node".to_string(),
+            node_id: NodeId::from("test-node"),
             pipeline_uid: PipelineUid::default(),
         };
         let merge_planner = MergePlanner::new(
-            pipeline_id,
+            &pipeline_id.merge_pipeline_id(),
             Vec::new(),
             merge_policy.clone(),
-            merge_op_mailbox,
+            merge_task_mailbox,
+            universe.get_or_spawn_one::<MergeSchedulerService>(),
         );
         let mut split_index: HashMap<String, SplitMetadata> = HashMap::default();
         let (merge_planner_mailbox, merge_planner_handler) =
             universe.spawn_builder().spawn(merge_planner);
-        let mut split_metadatas: Vec<SplitMetadata> = Vec::new();
+
         for split in incoming_splits {
             split_index.insert(split.split_id().to_string(), split.clone());
             merge_planner_mailbox
@@ -388,12 +447,11 @@ pub mod tests {
             loop {
                 let obs = merge_planner_handler.process_pending_and_observe().await;
                 assert_eq!(obs.obs_type, quickwit_actors::ObservationType::Alive);
-                let merge_ops =
-                    merge_op_inbox.drain_for_test_typed::<TrackedObject<MergeOperation>>();
-                if merge_ops.is_empty() {
+                let merge_tasks = merge_task_inbox.drain_for_test_typed::<MergeTask>();
+                if merge_tasks.is_empty() {
                     break;
                 }
-                let new_splits: Vec<SplitMetadata> = merge_ops
+                let new_splits: Vec<SplitMetadata> = merge_tasks
                     .into_iter()
                     .map(|merge_op| apply_merge(&merge_policy, &mut split_index, &merge_op))
                     .collect();
@@ -401,9 +459,25 @@ pub mod tests {
                     .send_message(NewSplits { new_splits })
                     .await?;
             }
-            split_metadatas = split_index.values().cloned().collect();
+            let split_metadatas: Vec<SplitMetadata> = split_index.values().cloned().collect();
             check_final_configuration(&split_metadatas);
         }
+
+        merge_planner_mailbox
+            .send_message(RunFinalizeMergePolicyAndQuit)
+            .await
+            .unwrap();
+
+        let obs = merge_planner_handler.process_pending_and_observe().await;
+        assert_eq!(obs.obs_type, quickwit_actors::ObservationType::PostMortem);
+
+        let merge_tasks = merge_task_inbox.drain_for_test_typed::<MergeTask>();
+        for merge_task in merge_tasks {
+            apply_merge(&merge_policy, &mut split_index, &merge_task);
+        }
+
+        let split_metadatas: Vec<SplitMetadata> = split_index.values().cloned().collect();
+
         universe.assert_quit().await;
         Ok(split_metadatas)
     }
@@ -431,10 +505,10 @@ pub mod tests {
         }
     }
 
-    pub async fn aux_test_simulate_merge_planner_num_docs<CheckFn: Fn(&[SplitMetadata])>(
+    pub async fn aux_test_simulate_merge_planner_num_docs(
         merge_policy: Arc<dyn MergePolicy>,
         batch_num_docs: &[usize],
-        check_final_configuration: CheckFn,
+        check_final_configuration: &dyn Fn(&[SplitMetadata]),
     ) -> anyhow::Result<Vec<SplitMetadata>> {
         let split_metadatas: Vec<SplitMetadata> = batch_num_docs
             .iter()

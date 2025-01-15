@@ -44,11 +44,6 @@ expected:
         metadata_field: false
         searchable: true
         aggregatable: true
-    _field_presence:
-      long:
-        metadata_field: false
-        searchable: true
-        aggregatable: false
     response:
       long:
         metadata_field: false
@@ -78,6 +73,31 @@ expected:
         searchable: true
         aggregatable: true
       text:
+        metadata_field: false
+        searchable: true
+        aggregatable: true
+---
+# Test _field_caps API with timestamp filter
+method: [GET]
+engines:
+  - quickwit
+endpoint: fieldcaps/_field_caps?start_timestamp=1684993001
+expected:
+  indices:
+  - fieldcaps
+  fields:
+    $expect: "not 'id' in val" # Filtered by start_timestamp
+    mixed: # This is a little weird case (values [5, -5.5]), since coercion happens only on the columnar side. That's why `long` is not aggregatable.
+      long: 
+        metadata_field: false
+        searchable: true
+        aggregatable: false 
+      double:
+        metadata_field: false
+        searchable: true
+        aggregatable: true
+    date:
+      date_nanos:
         metadata_field: false
         searchable: true
         aggregatable: true
@@ -291,7 +311,7 @@ expected:
         searchable: true
         aggregatable: true
 ---
-# Exact match index + Non matching excact index
+# Exact match index + Non matching exact index
 method: [GET]
 engines:
   - quickwit
@@ -314,4 +334,3 @@ engines:
   - elasticsearch
 endpoint: doesno*texist/_field_caps?fields=date
 status_code: 200
-

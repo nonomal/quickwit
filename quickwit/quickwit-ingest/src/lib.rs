@@ -20,24 +20,24 @@
 #![deny(clippy::disallowed_methods)]
 
 mod doc_batch;
-mod errors;
+pub mod error;
 mod ingest_api_service;
 #[path = "codegen/ingest_service.rs"]
 mod ingest_service;
 mod ingest_v2;
 mod memory_capacity;
 mod metrics;
+mod mrecordlog_async;
 mod notifications;
 mod position;
 mod queue;
-mod semaphore_with_waiter;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 pub use doc_batch::*;
-pub use errors::IngestServiceError;
+pub use error::IngestServiceError;
 pub use ingest_api_service::{GetMemoryCapacity, GetPartitionId, IngestApiService};
 pub use ingest_service::*;
 pub use ingest_v2::*;
@@ -126,35 +126,6 @@ impl CommitType {
 }
 
 #[macro_export]
-macro_rules! with_request_metrics {
-    ($future:expr, $($label:tt),*) => {
-        {
-            let now = std::time::Instant::now();
-            $crate::ingest_v2::metrics::INGEST_V2_METRICS
-                .grpc_requests_in_flight
-                .with_label_values([$($label),*])
-                .inc();
-            let result = $future;
-            $crate::ingest_v2::metrics::INGEST_V2_METRICS
-                .grpc_requests_in_flight
-                .with_label_values([$($label),*])
-                .dec();
-            let status_label = match &result {
-                Ok(_) => "success",
-                Err(error) => error.label_value(),
-            };
-            $crate::ingest_v2::metrics::INGEST_V2_METRICS.grpc_requests_total
-                .with_label_values([$($label),*, status_label])
-                .inc();
-            $crate::ingest_v2::metrics::INGEST_V2_METRICS.grpc_request_duration_secs
-                .with_label_values([$($label),*, status_label])
-                .observe(now.elapsed().as_secs_f64());
-            result
-        }
-    }
-}
-
-#[macro_export]
 macro_rules! with_lock_metrics {
     ($future:expr, $($label:tt),*) => {
         {
@@ -162,8 +133,17 @@ macro_rules! with_lock_metrics {
                 .wal_acquire_lock_requests_in_flight
                 .with_label_values([$($label),*])
                 .inc();
+
             let now = std::time::Instant::now();
             let guard = $future;
+
+            let elapsed = now.elapsed();
+            if elapsed > std::time::Duration::from_secs(1) {
+                quickwit_common::rate_limited_warn!(
+                    limit_per_min=6,
+                    "lock acquisition took {}ms", elapsed.as_millis()
+                );
+            }
             $crate::ingest_v2::metrics::INGEST_V2_METRICS
                 .wal_acquire_lock_requests_in_flight
                 .with_label_values([$($label),*])
@@ -171,7 +151,8 @@ macro_rules! with_lock_metrics {
             $crate::ingest_v2::metrics::INGEST_V2_METRICS
                 .wal_acquire_lock_request_duration_secs
                 .with_label_values([$($label),*])
-                .observe(now.elapsed().as_secs_f64());
+                .observe(elapsed.as_secs_f64());
+
             guard
         }
     }
@@ -180,8 +161,8 @@ macro_rules! with_lock_metrics {
 #[cfg(test)]
 mod tests {
 
-    use bytesize::ByteSize;
     use quickwit_actors::AskError;
+    use quickwit_proto::ingest::RateLimitingCause;
 
     use super::*;
     use crate::{CreateQueueRequest, IngestRequest, SuggestTruncateRequest};
@@ -270,11 +251,13 @@ mod tests {
         let queues_dir_path = temp_dir.path().join("queues-0");
         get_ingest_api_service(&queues_dir_path).await.unwrap_err();
 
-        let ingest_api_config = IngestApiConfig {
-            max_queue_memory_usage: ByteSize(1200),
-            max_queue_disk_usage: ByteSize::mib(256),
-            ..Default::default()
-        };
+        let ingest_api_config = serde_json::from_str(
+            r#"{
+            "max_queue_memory_usage": "1200b",
+            "max_queue_disk_usage": "256mb"
+        }"#,
+        )
+        .unwrap();
         init_ingest_api(&universe, &queues_dir_path, &ingest_api_config)
             .await
             .unwrap();
@@ -312,7 +295,7 @@ mod tests {
                 .ask_for_res(ingest_request.clone())
                 .await
                 .unwrap_err(),
-            AskError::ErrorReply(IngestServiceError::RateLimited)
+            AskError::ErrorReply(IngestServiceError::RateLimited(RateLimitingCause::WalFull))
         ));
 
         // delete the first batch

@@ -36,11 +36,12 @@ impl WaitHandle {
     }
 }
 
-pub struct WaitDropGuard(oneshot::Sender<()>);
+pub struct WaitDropGuard(#[allow(dead_code)] oneshot::Sender<()>);
 
 #[cfg(test)]
 mod tests {
     use tokio::sync::oneshot::error::TryRecvError;
+
     #[tokio::test]
     async fn test_wait_handle_simple() {
         let (wait_drop_handle, mut wait_handle) = super::WaitHandle::new();

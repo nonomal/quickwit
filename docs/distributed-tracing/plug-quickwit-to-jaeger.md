@@ -32,24 +32,24 @@ We can rely on `host.docker.internal` to get the docker bridge ip address, point
 
 ```bash
 docker run --rm --name jaeger-qw \
-    -e SPAN_STORAGE_TYPE=grpc-plugin \
+    -e SPAN_STORAGE_TYPE=grpc \
     -e GRPC_STORAGE_SERVER=host.docker.internal:7281 \
     -p 16686:16686 \
-    jaegertracing/jaeger-query:latest
+    jaegertracing/jaeger-query:1.60
 ```
 
 ### Linux
 
-By default, quickwit is listening to `127.0.0.1`, and will not respond to request directed
+By default, Quickwit is listening to `127.0.0.1`, and will not respond to request directed
 to the docker bridge (`172.17.0.1`). There are different ways to solve this problem.
 The easiest is probably to use host network mode.
 
 ```bash
 docker run --rm --name jaeger-qw  --network=host \
-    -e SPAN_STORAGE_TYPE=grpc-plugin \
+    -e SPAN_STORAGE_TYPE=grpc \
     -e GRPC_STORAGE_SERVER=127.0.0.1:7281 \
     -p 16686:16686 \
-    jaegertracing/jaeger-query:latest
+    jaegertracing/jaeger-query:1.60
 
 ```
 

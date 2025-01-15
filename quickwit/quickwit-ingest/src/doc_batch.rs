@@ -19,6 +19,7 @@
 
 use bytes::buf::Writer;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use quickwit_proto::types::IndexId;
 use serde::Serialize;
 
 use crate::DocBatch;
@@ -96,14 +97,14 @@ where T: Buf + Default
 
 /// Builds DocBatch from individual commands
 pub struct DocBatchBuilder {
-    index_id: String,
+    index_id: IndexId,
     doc_buffer: BytesMut,
     doc_lengths: Vec<u32>,
 }
 
 impl DocBatchBuilder {
     /// Creates a new batch builder for the given index name.
-    pub fn new(index_id: String) -> Self {
+    pub fn new(index_id: IndexId) -> Self {
         Self {
             index_id,
             doc_buffer: BytesMut::new(),
@@ -113,7 +114,7 @@ impl DocBatchBuilder {
 
     /// Creates a new batch builder for the given index name with some pre-allocated capacity for
     /// the internal doc buffer.
-    pub fn with_capacity(index_id: String, capacity: usize) -> Self {
+    pub fn with_capacity(index_id: IndexId, capacity: usize) -> Self {
         Self {
             index_id,
             doc_buffer: BytesMut::with_capacity(capacity),
@@ -171,7 +172,7 @@ impl DocBatchBuilder {
 /// A wrapper around batch builder that can add a Serialize structs
 
 pub struct JsonDocBatchBuilder {
-    index_id: String,
+    index_id: IndexId,
     doc_buffer: Writer<BytesMut>,
     doc_lengths: Vec<u32>,
 }
@@ -211,20 +212,25 @@ impl JsonDocBatchBuilder {
 
 impl DocBatch {
     /// Returns an iterator over the document payloads within a doc_batch.
-    pub fn iter(&self) -> impl Iterator<Item = DocCommand<Bytes>> + '_ {
-        self.iter_raw().map(DocCommand::read)
+    #[allow(clippy::should_implement_trait)]
+    pub fn into_iter(self) -> impl Iterator<Item = DocCommand<Bytes>> {
+        self.into_iter_raw().map(DocCommand::read)
     }
 
     /// Returns an iterator over the document payloads within a doc_batch.
-    pub fn iter_raw(&self) -> impl Iterator<Item = Bytes> + '_ {
-        self.doc_lengths
-            .iter()
-            .cloned()
-            .scan(0, |current_offset, doc_num_bytes| {
+    pub fn into_iter_raw(self) -> impl Iterator<Item = Bytes> {
+        let DocBatch {
+            doc_buffer,
+            doc_lengths,
+            ..
+        } = self;
+        doc_lengths
+            .into_iter()
+            .scan(0, move |current_offset, doc_num_bytes| {
                 let start = *current_offset;
                 let end = start + doc_num_bytes as usize;
                 *current_offset = end;
-                Some(self.doc_buffer.slice(start..end))
+                Some(doc_buffer.slice(start..end))
             })
     }
 
@@ -341,7 +347,7 @@ mod tests {
         assert_eq!(batch.num_docs(), 4);
         assert_eq!(batch.num_bytes(), 5 + 1 + 5 + 4);
 
-        let mut iter = batch.iter();
+        let mut iter = batch.clone().into_iter();
         assert!(commands_eq(
             iter.next().unwrap(),
             DocCommand::Ingest {
@@ -367,7 +373,7 @@ mod tests {
         assert!(iter.next().is_none());
 
         let mut copied_batch = DocBatchBuilder::new("test".to_string());
-        for raw_buf in batch.iter_raw() {
+        for raw_buf in batch.clone().into_iter_raw() {
             copied_batch.command_from_buf(raw_buf);
         }
         let copied_batch = copied_batch.build();
@@ -389,7 +395,7 @@ mod tests {
         assert_eq!(batch.num_docs(), 3);
         assert_eq!(batch.num_bytes(), 12 + 12 + 3);
 
-        let mut iter = batch.iter();
+        let mut iter = batch.into_iter();
         assert!(commands_eq(
             iter.next().unwrap(),
             DocCommand::Ingest {

@@ -30,8 +30,10 @@ impl Default for CliMetrics {
             thread_unpark_duration_microseconds: new_histogram_vec(
                 "thread_unpark_duration_microseconds",
                 "Duration for which a thread of the main tokio runtime is unparked.",
-                "quickwit_cli",
+                "cli",
+                &[],
                 [],
+                quickwit_common::metrics::exponential_buckets(5.0, 5.0, 5).unwrap(),
             ),
         }
     }

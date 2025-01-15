@@ -25,10 +25,6 @@ use futures::Future;
 use rand::Rng;
 use tracing::{debug, warn};
 
-const DEFAULT_MAX_ATTEMPTS: usize = 30;
-const DEFAULT_BASE_DELAY: Duration = Duration::from_millis(250);
-const DEFAULT_MAX_DELAY: Duration = Duration::from_secs(20);
-
 pub trait Retryable {
     fn is_retryable(&self) -> bool {
         false
@@ -66,17 +62,37 @@ pub struct RetryParams {
     pub max_attempts: usize,
 }
 
-impl Default for RetryParams {
-    fn default() -> Self {
+impl RetryParams {
+    /// Creates a new [`RetryParams`] instance using the same settings as the standard retry policy
+    /// defined in the AWS SDK for Rust.
+    pub fn standard() -> Self {
         Self {
-            base_delay: DEFAULT_BASE_DELAY,
-            max_delay: DEFAULT_MAX_DELAY,
-            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(20),
+            max_attempts: 3,
         }
     }
-}
 
-impl RetryParams {
+    /// Creates a new [`RetryParams`] instance using settings that are more aggressive than those of
+    /// the standard policy for services that are more resilient to retries, usually managed
+    /// cloud services.
+    pub fn aggressive() -> Self {
+        Self {
+            base_delay: Duration::from_millis(250),
+            max_delay: Duration::from_secs(20),
+            max_attempts: 5,
+        }
+    }
+
+    /// Creates a new [`RetryParams`] instance that does not perform any retries.
+    pub fn no_retries() -> Self {
+        Self {
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            max_attempts: 1,
+        }
+    }
+
     /// Computes the delay after which a new attempt should be performed. The randomized delay
     /// increases after each attempt (exponential backoff and full jitter). Implementation and
     /// default values originate from the Java SDK. See also: <https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/>.
@@ -89,12 +105,13 @@ impl RetryParams {
     /// Panics if `num_attempts` is zero.
     pub fn compute_delay(&self, num_attempts: usize) -> Duration {
         assert!(num_attempts > 0, "num_attempts should be greater than zero");
-
-        let delay_ms = self.base_delay.as_millis() as u64 * 2u64.pow(num_attempts as u32 - 1);
-        let ceil_delay_ms = delay_ms.min(self.max_delay.as_millis() as u64);
-        let half_delay_ms = ceil_delay_ms / 2;
-        let jitter_range = 0..half_delay_ms + 1;
-        let jittered_delay_ms = half_delay_ms + rand::thread_rng().gen_range(jitter_range);
+        let num_attempts = num_attempts.min(32);
+        let delay_ms = (self.base_delay.as_millis() as u64)
+            .saturating_mul(2u64.saturating_pow(num_attempts as u32 - 1));
+        let capped_delay_ms = delay_ms.min(self.max_delay.as_millis() as u64);
+        let half_delay_ms = (capped_delay_ms + 1) / 2;
+        let jitter_range = half_delay_ms..capped_delay_ms + 1;
+        let jittered_delay_ms = rand::thread_rng().gen_range(jitter_range);
         Duration::from_millis(jittered_delay_ms)
     }
 
@@ -103,7 +120,7 @@ impl RetryParams {
         Self {
             base_delay: Duration::from_millis(1),
             max_delay: Duration::from_millis(2),
-            ..Default::default()
+            max_attempts: 3,
         }
     }
 }
@@ -210,7 +227,11 @@ mod tests {
         let noop_mock = NoopSleep;
         let values_it = RwLock::new(values.into_iter());
         retry_with_mockable_sleep(
-            &RetryParams::default(),
+            &RetryParams {
+                base_delay: Duration::from_millis(1),
+                max_delay: Duration::from_millis(2),
+                max_attempts: 30,
+            },
             || ready(values_it.write().unwrap().next().unwrap()),
             noop_mock,
         )
@@ -257,5 +278,31 @@ mod tests {
             .chain(Some(Ok(())))
             .collect();
         assert_eq!(simulate_retries(retry_sequence).await, Ok(()));
+    }
+
+    fn test_retry_delay_does_not_overflow_aux(retry_params: RetryParams) {
+        for i in 1..100 {
+            let delay = retry_params.compute_delay(i);
+            assert!(delay <= retry_params.max_delay);
+            if retry_params.base_delay <= retry_params.max_delay {
+                assert!(delay * 2 >= retry_params.base_delay);
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn test_retry_delay_does_not_overflow(
+            max_attempts in 1..1_000usize,
+            base_delay in 0..1_000u64,
+            max_delay in 0..60_000u64,
+        ) {
+            let retry_params = RetryParams {
+                max_attempts,
+                base_delay: Duration::from_millis(base_delay),
+                max_delay: Duration::from_millis(max_delay),
+            };
+            test_retry_delay_does_not_overflow_aux(retry_params);
+        }
     }
 }

@@ -22,9 +22,7 @@ use serde::Serialize;
 use tracing::{info, warn};
 
 use crate::mailbox::Inbox;
-use crate::{
-    Actor, ActorContext, ActorExitStatus, ActorHandle, ActorState, Handler, Health, Supervisable,
-};
+use crate::{Actor, ActorContext, ActorExitStatus, ActorHandle, Handler, Health, Supervisable};
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize)]
 pub struct SupervisorMetrics {
@@ -83,8 +81,7 @@ impl<A: Actor> Actor for Supervisor<A> {
     }
 
     async fn initialize(&mut self, ctx: &ActorContext<Self>) -> Result<(), ActorExitStatus> {
-        ctx.schedule_self_msg(*crate::HEARTBEAT, SuperviseLoop)
-            .await;
+        ctx.schedule_self_msg(*crate::HEARTBEAT, SuperviseLoop);
         Ok(())
     }
 
@@ -152,7 +149,7 @@ impl<A: Actor> Supervisor<A> {
         // The actor is failing we need to restart it.
         let actor_handle = self.handle_opt.take().unwrap();
         let actor_mailbox = actor_handle.mailbox().clone();
-        let (actor_exit_status, _last_state) = if actor_handle.state() == ActorState::Processing {
+        let (actor_exit_status, _last_state) = if !actor_handle.state().is_exit() {
             // The actor is probably frozen.
             // Let's kill it.
             warn!("killing");
@@ -201,8 +198,7 @@ impl<A: Actor> Handler<SuperviseLoop> for Supervisor<A> {
         ctx: &ActorContext<Self>,
     ) -> Result<Self::Reply, ActorExitStatus> {
         self.supervise(ctx).await?;
-        ctx.schedule_self_msg(*crate::HEARTBEAT, SuperviseLoop)
-            .await;
+        ctx.schedule_self_msg(*crate::HEARTBEAT, SuperviseLoop);
         Ok(())
     }
 }

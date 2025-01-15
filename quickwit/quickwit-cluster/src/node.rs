@@ -25,6 +25,7 @@ use std::sync::Arc;
 use chitchat::{ChitchatId, NodeState};
 use quickwit_config::service::QuickwitService;
 use quickwit_proto::indexing::{CpuCapacity, IndexingTask};
+use quickwit_proto::types::NodeIdRef;
 use tonic::transport::Channel;
 
 use crate::member::build_cluster_member;
@@ -87,8 +88,8 @@ impl ClusterNode {
         &self.inner.chitchat_id
     }
 
-    pub fn node_id(&self) -> &str {
-        &self.inner.chitchat_id.node_id
+    pub fn node_id(&self) -> &NodeIdRef {
+        NodeIdRef::from_str(&self.inner.chitchat_id.node_id)
     }
 
     pub fn channel(&self) -> Channel {
@@ -97,6 +98,24 @@ impl ClusterNode {
 
     pub fn enabled_services(&self) -> &HashSet<QuickwitService> {
         &self.inner.enabled_services
+    }
+
+    pub fn is_indexer(&self) -> bool {
+        self.inner
+            .enabled_services
+            .contains(&QuickwitService::Indexer)
+    }
+
+    pub fn is_ingester(&self) -> bool {
+        self.inner
+            .enabled_services
+            .contains(&QuickwitService::Indexer)
+    }
+
+    pub fn is_searcher(&self) -> bool {
+        self.inner
+            .enabled_services
+            .contains(&QuickwitService::Searcher)
     }
 
     pub fn grpc_advertise_addr(&self) -> SocketAddr {

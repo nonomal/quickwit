@@ -18,27 +18,32 @@
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::BTreeSet;
-use std::net::SocketAddr;
+use std::error::Error;
 use std::sync::Arc;
 
 use bytesize::ByteSize;
+use quickwit_cluster::cluster_grpc_server;
 use quickwit_common::tower::BoxFutureInfaillible;
 use quickwit_config::service::QuickwitService;
+use quickwit_proto::developer::DeveloperServiceClient;
 use quickwit_proto::indexing::IndexingServiceClient;
 use quickwit_proto::jaeger::storage::v1::span_reader_plugin_server::SpanReaderPluginServer;
 use quickwit_proto::opentelemetry::proto::collector::logs::v1::logs_service_server::LogsServiceServer;
 use quickwit_proto::opentelemetry::proto::collector::trace::v1::trace_service_server::TraceServiceServer;
 use quickwit_proto::search::search_service_server::SearchServiceServer;
 use quickwit_proto::tonic::codegen::CompressionEncoding;
+use quickwit_proto::tonic::transport::server::TcpIncoming;
 use quickwit_proto::tonic::transport::Server;
+use tokio::net::TcpListener;
 use tracing::*;
 
+use crate::developer_api::DeveloperApiServer;
 use crate::search_api::GrpcSearchAdapter;
-use crate::QuickwitServices;
+use crate::{QuickwitServices, INDEXING_GRPC_SERVER_METRICS_LAYER};
 
 /// Starts and binds gRPC services to `grpc_listen_addr`.
 pub(crate) async fn start_grpc_server(
-    grpc_listen_addr: SocketAddr,
+    tcp_listener: TcpListener,
     max_message_size: ByteSize,
     services: Arc<QuickwitServices>,
     readiness_trigger: BoxFutureInfaillible<()>,
@@ -46,6 +51,8 @@ pub(crate) async fn start_grpc_server(
 ) -> anyhow::Result<()> {
     let mut enabled_grpc_services = BTreeSet::new();
     let mut server = Server::builder();
+
+    let cluster_grpc_service = cluster_grpc_server(services.cluster.clone());
 
     // Mount gRPC metastore service if `QuickwitService::Metastore` is enabled on node.
     let metastore_grpc_service = if let Some(metastore_server) = &services.metastore_server_opt {
@@ -61,7 +68,9 @@ pub(crate) async fn start_grpc_server(
     {
         if let Some(indexing_service) = services.indexing_service_opt.clone() {
             enabled_grpc_services.insert("indexing");
-            let indexing_service = IndexingServiceClient::from_mailbox(indexing_service);
+            let indexing_service = IndexingServiceClient::tower()
+                .stack_layer(INDEXING_GRPC_SERVER_METRICS_LAYER.clone())
+                .build_from_mailbox(indexing_service);
             Some(indexing_service.as_grpc_service(max_message_size))
         } else {
             None
@@ -84,26 +93,22 @@ pub(crate) async fn start_grpc_server(
         .is_service_enabled(QuickwitService::Indexer)
     {
         enabled_grpc_services.insert("ingest-router");
-        Some(
-            services
-                .ingest_router_service
-                .as_grpc_service(max_message_size),
-        )
+
+        let ingest_router_service = services
+            .ingest_router_service
+            .as_grpc_service(max_message_size);
+        Some(ingest_router_service)
     } else {
         None
     };
-    let ingester_grpc_service = if services
-        .node_config
-        .is_service_enabled(QuickwitService::Indexer)
-    {
+
+    let ingester_grpc_service = if let Some(ingester_service) = services.ingester_service() {
         enabled_grpc_services.insert("ingester");
-        services
-            .ingester_service_opt
-            .as_ref()
-            .map(|ingester_service| ingester_service.as_grpc_service(max_message_size))
+        Some(ingester_service.as_grpc_service(max_message_size))
     } else {
         None
     };
+
     // Mount gRPC control plane service if `QuickwitService::ControlPlane` is enabled on node.
     let control_plane_grpc_service = if services
         .node_config
@@ -112,7 +117,7 @@ pub(crate) async fn start_grpc_server(
         enabled_grpc_services.insert("control-plane");
         Some(
             services
-                .control_plane_service
+                .control_plane_client
                 .as_grpc_service(max_message_size),
         )
     } else {
@@ -121,7 +126,7 @@ pub(crate) async fn start_grpc_server(
     // Mount gRPC OpenTelemetry OTLP services if present.
     let otlp_trace_grpc_service =
         if let Some(otlp_traces_service) = services.otlp_traces_service_opt.clone() {
-            enabled_grpc_services.insert("otlp-trace");
+            enabled_grpc_services.insert("otlp-traces");
             let trace_service = TraceServiceServer::new(otlp_traces_service)
                 .accept_compressed(CompressionEncoding::Gzip);
             Some(trace_service)
@@ -130,7 +135,7 @@ pub(crate) async fn start_grpc_server(
         };
     let otlp_log_grpc_service =
         if let Some(otlp_logs_service) = services.otlp_logs_service_opt.clone() {
-            enabled_grpc_services.insert("otlp-log");
+            enabled_grpc_services.insert("otlp-logs");
             let logs_service = LogsServiceServer::new(otlp_logs_service)
                 .accept_compressed(CompressionEncoding::Gzip);
             Some(logs_service)
@@ -161,7 +166,17 @@ pub(crate) async fn start_grpc_server(
     } else {
         None
     };
+    let developer_grpc_service = {
+        enabled_grpc_services.insert("developer");
+
+        let developer_service = DeveloperApiServer::from_services(&services);
+
+        DeveloperServiceClient::new(developer_service)
+            .as_grpc_service(DeveloperApiServer::MAX_GRPC_MESSAGE_SIZE)
+    };
     let server_router = server
+        .add_service(cluster_grpc_service)
+        .add_service(developer_grpc_service)
         .add_optional_service(control_plane_grpc_service)
         .add_optional_service(indexing_grpc_service)
         .add_optional_service(ingest_api_grpc_service)
@@ -173,12 +188,16 @@ pub(crate) async fn start_grpc_server(
         .add_optional_service(otlp_trace_grpc_service)
         .add_optional_service(search_grpc_service);
 
+    let grpc_listen_addr = tcp_listener.local_addr()?;
     info!(
         enabled_grpc_services=?enabled_grpc_services,
         grpc_listen_addr=?grpc_listen_addr,
-        "Starting gRPC server listening on {grpc_listen_addr}."
+        "starting gRPC server listening on {grpc_listen_addr}"
     );
-    let serve_fut = server_router.serve_with_shutdown(grpc_listen_addr, shutdown_signal);
+    // nodelay=true and keepalive=None are the default values for Server::builder()
+    let tcp_incoming = TcpIncoming::from_listener(tcp_listener, true, None)
+        .map_err(|err: Box<dyn Error + Send + Sync>| anyhow::anyhow!(err))?;
+    let serve_fut = server_router.serve_with_incoming_shutdown(tcp_incoming, shutdown_signal);
     let (serve_res, _trigger_res) = tokio::join!(serve_fut, readiness_trigger);
     serve_res?;
     Ok(())

@@ -21,6 +21,7 @@ syntax = "proto3";
 
 package quickwit.indexing;
 
+import "quickwit/common.proto";
 import "quickwit/ingest.proto";
 
 service IndexingService {
@@ -38,13 +39,16 @@ message PipelineUid {
 
 message IndexingTask {
   // The tasks's index UID.
-  string index_uid = 1;
+  quickwit.common.IndexUid index_uid = 1;
   // The task's source ID.
   string source_id = 2;
   // pipeline id
   PipelineUid pipeline_uid = 4;
   // The shards assigned to the indexer.
   repeated quickwit.ingest.ShardId shard_ids = 3;
+  // Fingerprint of the pipeline parameters. Anything that should cause a pipeline restart (such
+  // as updating indexing settings or doc mapping) should influence this value.
+  uint64 params_fingerprint = 6;
 }
 
 message ApplyIndexingPlanResponse {}

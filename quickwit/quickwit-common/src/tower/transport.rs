@@ -134,6 +134,19 @@ where K: Hash + Eq + Send + Sync + Clone + 'static
     pub fn connection_keys_watcher(&self) -> watch::Receiver<HashSet<K>> {
         self.connection_keys_rx.clone()
     }
+
+    pub async fn wait_for(
+        &self,
+        timeout_after: Duration,
+        predicate: impl Fn(&HashSet<K>) -> bool,
+    ) -> bool {
+        tokio::time::timeout(
+            timeout_after,
+            self.connection_keys_watcher().wait_for(predicate),
+        )
+        .await
+        .is_ok()
+    }
 }
 
 /// `tower::buffer::Buffer` and `tower::balance::Balance` lazily polls their inner services. As a
@@ -193,10 +206,9 @@ pub async fn make_channel(socket_addr: SocketAddr) -> Channel {
         .authority(socket_addr.to_string())
         .path_and_query("/")
         .build()
-        .expect("The provided arguments should be valid.");
+        .expect("provided arguments should be valid");
     Endpoint::from(uri)
         .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(30))
         .connect_lazy()
 }
 

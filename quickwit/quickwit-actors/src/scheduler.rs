@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use quickwit_common::spawn_named_task;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
@@ -203,16 +204,19 @@ pub fn start_scheduler() -> SchedulerClient {
         }),
     };
     let mut scheduler = Scheduler::new(&scheduler_client);
-    tokio::spawn(async move {
-        while let Ok(scheduler_message) = rx.recv_async().await {
-            match scheduler_message {
-                SchedulerMessage::ProcessTime => scheduler.process_time(),
-                SchedulerMessage::Schedule { callback, timeout } => {
-                    scheduler.process_schedule(callback, timeout);
+    spawn_named_task(
+        async move {
+            while let Ok(scheduler_message) = rx.recv_async().await {
+                match scheduler_message {
+                    SchedulerMessage::ProcessTime => scheduler.process_time(),
+                    SchedulerMessage::Schedule { callback, timeout } => {
+                        scheduler.process_schedule(callback, timeout);
+                    }
                 }
             }
-        }
-    });
+        },
+        "scheduler",
+    );
     scheduler_client
 }
 
@@ -319,10 +323,9 @@ impl Scheduler {
     /// Updates the simulated time shift, if appropriate.
     ///
     /// We advance time if:
-    /// - someone is actually requesting for a simulated fast forward in time.
-    /// (if Universe::simulate_time_shift(..) has been called).
-    /// - no message is queued for processing, no initialize or no finalize
-    /// is being processed.
+    /// - someone is actually requesting for a simulated fast forward in time. (if
+    ///   Universe::simulate_time_shift(..) has been called).
+    /// - no message is queued for processing, no initialize or no finalize is being processed.
     fn advance_time_if_necessary(&mut self) {
         let Some(scheduler_client) = self.scheduler_client() else {
             return;
@@ -398,7 +401,7 @@ mod tests {
             ctx: &ActorContext<Self>,
         ) -> Result<(), ActorExitStatus> {
             self.count.fetch_add(1, Ordering::SeqCst);
-            ctx.schedule_self_msg(Duration::from_secs(1), Tick).await;
+            ctx.schedule_self_msg(Duration::from_secs(1), Tick);
             Ok(())
         }
     }

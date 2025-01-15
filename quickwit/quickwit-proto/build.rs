@@ -26,13 +26,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Prost + tonic + Quickwit codegen for control plane, indexing, metastore, ingest and search
     // services.
     //
-    // Control plane.
+    // Cluster service.
     Codegen::builder()
+        .with_protos(&["protos/quickwit/cluster.proto"])
+        .with_output_dir("src/codegen/quickwit")
+        .with_result_type_path("crate::cluster::ClusterResult")
+        .with_error_type_path("crate::cluster::ClusterError")
+        .generate_rpc_name_impls()
+        .run()
+        .unwrap();
+
+    // Control plane.
+    let mut prost_config = prost_build::Config::default();
+    prost_config
+        .extern_path(
+            ".quickwit.common.DocMappingUid",
+            "crate::types::DocMappingUid",
+        )
+        .extern_path(".quickwit.common.IndexUid", "crate::types::IndexUid");
+
+    Codegen::builder()
+        .with_prost_config(prost_config)
         .with_protos(&["protos/quickwit/control_plane.proto"])
         .with_includes(&["protos"])
         .with_output_dir("src/codegen/quickwit")
         .with_result_type_path("crate::control_plane::ControlPlaneResult")
         .with_error_type_path("crate::control_plane::ControlPlaneError")
+        .run()
+        .unwrap();
+
+    // Developer service.
+    let mut prost_config = prost_build::Config::default();
+    prost_config.bytes(["GetDebugInfoResponse.debug_info_json"]);
+
+    Codegen::builder()
+        .with_prost_config(prost_config)
+        .with_protos(&["protos/quickwit/developer.proto"])
+        .with_output_dir("src/codegen/quickwit")
+        .with_result_type_path("crate::developer::DeveloperResult")
+        .with_error_type_path("crate::developer::DeveloperError")
+        .generate_rpc_name_impls()
         .run()
         .unwrap();
 
@@ -43,6 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ".quickwit.indexing.PipelineUid",
             "crate::types::PipelineUid",
         )
+        .extern_path(".quickwit.common.IndexUid", "crate::types::IndexUid")
         .extern_path(".quickwit.ingest.ShardId", "crate::types::ShardId");
 
     Codegen::builder()
@@ -58,7 +92,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Metastore service.
     let mut prost_config = prost_build::Config::default();
     prost_config
+        .bytes([
+            "IndexesMetadataResponse.indexes_metadata_json_zstd",
+            "ListIndexesMetadataResponse.indexes_metadata_json_zstd",
+        ])
+        .extern_path(
+            ".quickwit.common.DocMappingUid",
+            "crate::types::DocMappingUid",
+        )
+        .extern_path(".quickwit.common.IndexUid", "crate::types::IndexUid")
         .extern_path(".quickwit.ingest.ShardId", "crate::types::ShardId")
+        .field_attribute("DeleteQuery.index_uid", "#[schema(value_type = String)]")
         .field_attribute("DeleteQuery.index_uid", "#[serde(alias = \"index_id\")]")
         .field_attribute("DeleteQuery.query_ast", "#[serde(alias = \"query\")]")
         .field_attribute(
@@ -78,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_result_type_path("crate::metastore::MetastoreResult")
         .with_error_type_path("crate::metastore::MetastoreError")
         .generate_extra_service_methods()
-        .generate_prom_labels_for_requests()
+        .generate_rpc_name_impls()
         .run()
         .unwrap();
 
@@ -90,6 +134,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "MRecordBatch.mrecord_buffer",
             "Position.position",
         ])
+        .extern_path(
+            ".quickwit.common.DocMappingUid",
+            "crate::types::DocMappingUid",
+        )
+        .extern_path(".quickwit.common.DocUid", "crate::types::DocUid")
+        .extern_path(".quickwit.common.IndexUid", "crate::types::IndexUid")
         .extern_path(".quickwit.ingest.Position", "crate::types::Position")
         .extern_path(".quickwit.ingest.ShardId", "crate::types::ShardId")
         .type_attribute("Shard", "#[derive(Eq)]")
@@ -108,6 +158,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .field_attribute(
             "Shard.replication_position_inclusive",
             "#[serde(default, skip_serializing_if = \"Option::is_none\")]",
+        )
+        .field_attribute(
+            "Shard.update_timestamp",
+            "#[serde(default = \"super::compatibility_shard_update_timestamp\")]",
         );
 
     Codegen::builder()
@@ -120,6 +174,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_output_dir("src/codegen/quickwit")
         .with_result_type_path("crate::ingest::IngestV2Result")
         .with_error_type_path("crate::ingest::IngestV2Error")
+        .generate_rpc_name_impls()
         .run()
         .unwrap();
 
@@ -129,7 +184,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tonic_build::configure()
         .enum_attribute(".", "#[serde(rename_all=\"snake_case\")]")
-        .type_attribute(".", "#[derive(Serialize, Deserialize, utoipa::ToSchema)]")
+        .type_attribute(
+            ".",
+            "#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]",
+        )
         .type_attribute("PartialHit", "#[derive(Eq, Hash)]")
         .type_attribute("PartialHit.sort_value", "#[derive(Copy)]")
         .type_attribute("SearchRequest", "#[derive(Eq, Hash)]")
@@ -159,8 +217,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let protos = find_protos("protos/third-party/opentelemetry");
     tonic_build::configure()
-        .type_attribute(".", "#[derive(Serialize, Deserialize)]")
+        .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
         .type_attribute("StatusCode", r#"#[serde(rename_all = "snake_case")]"#)
+        .type_attribute(
+            "ExportLogsServiceResponse",
+            r#"#[derive(utoipa::ToSchema)]"#,
+        )
         .out_dir("src/codegen/opentelemetry")
         .compile_with_config(prost_config, &protos, &["protos/third-party"])?;
     Ok(())
